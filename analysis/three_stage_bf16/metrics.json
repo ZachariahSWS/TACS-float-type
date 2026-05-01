@@ -1,0 +1,14 @@
+{
+  "num_samples": 300,
+  "mse": 0.13848675787448883,
+  "persistence_mse": 0.7435587644577026,
+  "mse_vs_persistence_ratio": 0.18624857172585538,
+  "relative_l2": 0.05845153356974084,
+  "tke_spectrum_relative_l2": 0.002414052702009378,
+  "enstrophy_spectrum_relative_l2": 0.000957809912791259,
+  "stage_paths": [
+    "./runs/three_stage_bf16/stage1/best.pt",
+    "./runs/three_stage_bf16/stage2/best.pt",
+    "./runs/three_stage_bf16/stage3/best.pt"
+  ]
+}

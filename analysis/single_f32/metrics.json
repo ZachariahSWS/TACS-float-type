@@ -1,0 +1,12 @@
+{
+  "num_samples": 300,
+  "mse": 0.13838310539722443,
+  "persistence_mse": 0.7435587644577026,
+  "mse_vs_persistence_ratio": 0.18610917120740408,
+  "relative_l2": 0.058429207652807236,
+  "tke_spectrum_relative_l2": 0.00164511148344898,
+  "enstrophy_spectrum_relative_l2": 0.0004941076216055518,
+  "stage_paths": [
+    "runs/single_f32/stage1/best.pt"
+  ]
+}

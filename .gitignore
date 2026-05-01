@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtualenv / local tool caches
+.venv/
+.uv-cache/
+flake.nix
+flake.lock
+
+# OS/editor noise
+.DS_Store
+
+# Local tool shims
+.cuda-shim/
+.ptxas-shim/
+
+# Experiment outputs
+runs/
+py2d_output/
+
+# Generated figures / animations
+*.gif
+*.png
+*.mp4
+
+# Checkpoints / arrays / training artifacts
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.mat
+
+!10000.mat
