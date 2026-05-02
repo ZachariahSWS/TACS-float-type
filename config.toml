@@ -1,0 +1,33 @@
+[data]
+data_path = "py2d_output/output.h5"
+field = "omega"
+train_start = 500
+train_stop = 8500
+val_start = 8500
+val_stop = 9000
+
+[run]
+experiment = "single"
+output_dir = "runs/fp32_single"
+seed = 0
+resume = false
+
+[optimization]
+batch_size = 2
+epochs = 100
+lr = 1e-4
+weight_decay = 1e-4
+grad_clip_norm = 1.0
+
+[loader]
+num_workers = 4
+prefetch_factor = 4
+persistent_workers = true
+pin_memory = true
+
+[noise]
+stage1_noise_scale = 0.0
+stage2_noise_scale = 0.0
+stage3_noise_scale = 0.0
+initial_noise_mse = 0.5
+mask_seed = 0

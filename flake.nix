@@ -24,6 +24,7 @@
         pkg-config
 
         git
+        gh
         ripgrep
         fd
 
