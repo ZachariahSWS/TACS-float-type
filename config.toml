@@ -1,3 +1,5 @@
+config_version = 2
+
 [data]
 data_path = "py2d_output/output.h5"
 field = "omega"
@@ -7,10 +9,21 @@ val_start = 8500
 val_stop = 9000
 
 [run]
-experiment = "single"
 output_dir = "runs/fp32_single"
 seed = 0
 resume = false
+
+[model]
+image_size = 256
+patch_size = 8
+width = 128
+n_heads = 8
+mlp_dim = 512
+cleanup_hidden_channels = 32
+precision = "fp32"
+
+[stage.1]
+depth = 12
 
 [optimization]
 batch_size = 2
@@ -26,8 +39,6 @@ persistent_workers = true
 pin_memory = true
 
 [noise]
-stage1_noise_scale = 0.0
-stage2_noise_scale = 0.0
-stage3_noise_scale = 0.0
+noise_scale = 0.5
 initial_noise_mse = 0.5
 mask_seed = 0

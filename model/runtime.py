@@ -2,23 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 import torch
 
+from config import CONFIG_VERSION, StageConfig
 from vit_predictor import SingleStepViTPredictor
 
 
 Tensor = torch.Tensor
-
-IMAGE_SIZE = 256
-PATCH_SIZE = 8
-WIDTH = 128
-N_HEADS = 8
-MLP_DIM = 512
-CLEANUP_HIDDEN_CHANNELS = 32
 
 
 @dataclass(frozen=True)
@@ -29,45 +24,33 @@ class TargetNorm:
 
 @dataclass
 class StageBundle:
-    experiment: str
     stage: int
     checkpoint_path: str
     model: torch.nn.Module
     target_norm: TargetNorm
+    config: StageConfig
 
 
-def stage_in_channels(stage: int) -> int:
-    return {1: 1, 2: 2, 3: 3}[int(stage)]
-
-
-def num_stages_for_experiment(experiment: str) -> int:
-    return {"single": 1, "two_stage": 2, "three_stage": 3}[str(experiment)]
-
-
-def stage_depth(experiment: str) -> int:
-    return 12 if str(experiment) == "single" else 4
-
-
-def model_config_for_stage(*, experiment: str, stage: int) -> dict:
+def stage_model_kwargs(stage_config: StageConfig) -> dict:
     return {
-        "in_channels": stage_in_channels(stage),
-        "out_channels": 1,
-        "image_size": IMAGE_SIZE,
-        "patch_size": PATCH_SIZE,
-        "width": WIDTH,
-        "depth": stage_depth(experiment),
-        "n_heads": N_HEADS,
-        "mlp_dim": MLP_DIM,
-        "cleanup_hidden_channels": CLEANUP_HIDDEN_CHANNELS,
+        "in_channels": stage_config.in_channels,
+        "out_channels": stage_config.out_channels,
+        "image_size": stage_config.image_size,
+        "patch_size": stage_config.patch_size,
+        "width": stage_config.width,
+        "depth": stage_config.depth,
+        "n_heads": stage_config.n_heads,
+        "mlp_dim": stage_config.mlp_dim,
+        "cleanup_hidden_channels": stage_config.cleanup_hidden_channels,
     }
 
 
-def build_stage_model(*, experiment: str, stage: int) -> SingleStepViTPredictor:
-    return SingleStepViTPredictor(**model_config_for_stage(experiment=experiment, stage=stage))
+def build_stage_model(stage_config: StageConfig) -> SingleStepViTPredictor:
+    return SingleStepViTPredictor(**stage_model_kwargs(stage_config))
 
 
-def autocast_context(device: torch.device, experiment: str):
-    if experiment != "single" and device.type == "cuda":
+def autocast_context(device: torch.device, precision: str):
+    if precision == "bf16" and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
@@ -81,14 +64,9 @@ def unnormalize_target(x: Tensor, target_norm: TargetNorm) -> Tensor:
 
 
 def baseline_prediction_from_input(model_input_f32: Tensor) -> Tensor:
-    in_channels = int(model_input_f32.shape[1])
-    if in_channels == 1:
+    if int(model_input_f32.shape[1]) == 1:
         return model_input_f32[:, 0:1]
-    if in_channels == 2:
-        return model_input_f32[:, 1:2]
-    if in_channels == 3:
-        return model_input_f32[:, 1:2] + model_input_f32[:, 2:3]
-    raise ValueError(f"Unexpected input channel count: {in_channels}")
+    return model_input_f32[:, 1:].sum(dim=1, keepdim=True)
 
 
 def residual_target_from_input(model_input_f32: Tensor, x1_f32: Tensor) -> Tensor:
@@ -99,11 +77,10 @@ def reconstruct_full_prediction(model_input_f32: Tensor, pred_residual_f32: Tens
     return baseline_prediction_from_input(model_input_f32) + pred_residual_f32
 
 
-def checkpoint_payload(*, experiment: str, stage: int, model: torch.nn.Module, target_norm: TargetNorm, epoch: int, best_val_real_mse: float) -> dict:
+def checkpoint_payload(*, stage_config: StageConfig, model: torch.nn.Module, target_norm: TargetNorm, epoch: int, best_val_real_mse: float) -> dict:
     return {
-        "experiment": str(experiment),
-        "stage": int(stage),
-        "model_config": model_config_for_stage(experiment=experiment, stage=stage),
+        "config_version": CONFIG_VERSION,
+        "stage_config": asdict(stage_config),
         "model_state_dict": model.state_dict(),
         "target_norm": {"mean": float(target_norm.mean), "std": float(target_norm.std)},
         "epoch": int(epoch),
@@ -111,44 +88,54 @@ def checkpoint_payload(*, experiment: str, stage: int, model: torch.nn.Module, t
     }
 
 
-def save_best_checkpoint(*, path: str, experiment: str, stage: int, model: torch.nn.Module, target_norm: TargetNorm, epoch: int, best_val_real_mse: float) -> None:
+def save_best_checkpoint(*, path: str, stage_config: StageConfig, model: torch.nn.Module, target_norm: TargetNorm, epoch: int, best_val_real_mse: float) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(
-        checkpoint_payload(
-            experiment=experiment,
-            stage=stage,
-            model=model,
-            target_norm=target_norm,
-            epoch=epoch,
-            best_val_real_mse=best_val_real_mse,
-        ),
-        path,
-    )
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        torch.save(
+            checkpoint_payload(
+                stage_config=stage_config,
+                model=model,
+                target_norm=target_norm,
+                epoch=epoch,
+                best_val_real_mse=best_val_real_mse,
+            ),
+            tmp_path,
+        )
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def load_stage_bundle(path: str, device: torch.device) -> StageBundle:
     ckpt = torch.load(path, map_location="cpu")
-    model = SingleStepViTPredictor(**dict(ckpt["model_config"]))
+    version = int(ckpt.get("config_version", 0))
+    if version != CONFIG_VERSION:
+        raise ValueError(f"Expected checkpoint config_version={CONFIG_VERSION}, got {version} in {path}")
+
+    stage_config = StageConfig(**dict(ckpt["stage_config"]))
+    model = build_stage_model(stage_config)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device=device, dtype=torch.float32)
     model.eval()
 
     return StageBundle(
-        experiment=str(ckpt["experiment"]),
-        stage=int(ckpt["stage"]),
+        stage=stage_config.stage,
         checkpoint_path=path,
         model=model,
         target_norm=TargetNorm(
             mean=float(ckpt["target_norm"]["mean"]),
             std=float(ckpt["target_norm"]["std"]),
         ),
+        config=stage_config,
     )
 
 
 @torch.inference_mode()
 def run_stage_residual(bundle: StageBundle, model_input: Tensor, device: torch.device) -> Tensor:
     model_input_f32 = model_input.to(device=device, dtype=torch.float32, non_blocking=True)
-    with autocast_context(device, bundle.experiment):
+    with autocast_context(device, bundle.config.precision):
         pred_normed = bundle.model(model_input_f32)
     return unnormalize_target(pred_normed.to(dtype=torch.float32), bundle.target_norm)
 
@@ -160,32 +147,55 @@ def predict_cascade(stage_bundles: list[StageBundle], x0_batch: Tensor, device: 
 
     extras: dict[str, Tensor] = {}
     x0_f32 = x0_batch.to(device=device, dtype=torch.float32, non_blocking=True)
+    correction_channels: list[Tensor] = []
     pred = x0_f32
-    stage_input = x0_f32
 
-    for idx, bundle in enumerate(stage_bundles, start=1):
+    for stage, bundle in enumerate(stage_bundles, start=1):
+        if bundle.stage != stage:
+            raise ValueError(f"Expected stage bundle {stage}, got stage {bundle.stage}")
+
+        if stage == 1:
+            stage_input = x0_f32
+        else:
+            stage_input = torch.cat([x0_f32, *correction_channels], dim=1)
+
         delta = run_stage_residual(bundle, stage_input, device)
         pred = reconstruct_full_prediction(stage_input, delta)
-        extras[f"delta{idx}"] = delta
-        extras[f"pred{idx}"] = pred
 
-        if idx == 1 and len(stage_bundles) >= 2:
-            stage_input = torch.cat([x0_f32, pred], dim=1)
-        elif idx == 2 and len(stage_bundles) >= 3:
-            stage_input = torch.cat([x0_f32, extras["pred1"], delta], dim=1)
+        if stage == 1:
+            correction_channels = [pred]
+        else:
+            correction_channels.append(delta)
+
+        extras[f"delta{stage}"] = delta
+        extras[f"pred{stage}"] = pred
 
     return pred, extras
 
 
 def resolve_stage_paths(run_dir: str) -> list[str]:
-    paths = []
-    for stage in range(1, 4):
-        path = os.path.join(run_dir, f"stage{stage}", "best.pt")
+    stage_re = re.compile(r"^stage([0-9]+)$")
+    paths: list[tuple[int, str]] = []
+
+    for name in os.listdir(run_dir):
+        match = stage_re.match(name)
+        if match is None:
+            continue
+        stage = int(match.group(1))
+        path = os.path.join(run_dir, name, "best.pt")
         if os.path.exists(path):
-            paths.append(path)
+            paths.append((stage, path))
+
+    paths.sort(key=lambda item: item[0])
     if not paths:
         raise FileNotFoundError(f"No stage checkpoints found under {run_dir}")
-    return paths
+
+    stages = [stage for stage, _ in paths]
+    expected = list(range(1, len(stages) + 1))
+    if stages != expected:
+        raise FileNotFoundError(f"Stage checkpoints must be sequential starting at 1; got {stages}")
+
+    return [path for _, path in paths]
 
 
 def write_json(path: str, payload: dict) -> None:
