@@ -1,0 +1,23 @@
+{
+  "cascade_real_mse": 3.6137641154692504,
+  "config_version": 2,
+  "persistence_mse": 5.5331887071261665,
+  "stage_checkpoints": [
+    "runs/fp32_1/stage1/best.pt"
+  ],
+  "stages": [
+    {
+      "cleanup_hidden_channels": 32,
+      "depth": 12,
+      "image_size": 256,
+      "in_channels": 1,
+      "mlp_dim": 128,
+      "n_heads": 8,
+      "out_channels": 1,
+      "patch_size": 8,
+      "precision": "fp32",
+      "stage": 1,
+      "width": 32
+    }
+  ]
+}

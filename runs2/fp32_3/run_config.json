@@ -1,0 +1,58 @@
+{
+  "config_version": 2,
+  "data": {
+    "data_path": "/TACS-float-type/py2d_output/output.h5",
+    "field": "omega",
+    "train_start": 500,
+    "train_stop": 8500,
+    "val_start": 8500,
+    "val_stop": 9000
+  },
+  "loader": {
+    "num_workers": 4,
+    "persistent_workers": true,
+    "pin_memory": true,
+    "prefetch_factor": 4
+  },
+  "model": {
+    "cleanup_hidden_channels": 32,
+    "image_size": 256,
+    "mlp_dim": 512,
+    "n_heads": 8,
+    "patch_size": 8,
+    "precision": "fp32",
+    "width": 128
+  },
+  "noise": {
+    "initial_noise_mse": 0.5,
+    "mask_seed": 0,
+    "noise_scale": 0.5
+  },
+  "optimization": {
+    "batch_size": 32,
+    "epochs": 100,
+    "grad_clip_norm": 1.0,
+    "lr": 0.0001,
+    "weight_decay": 0.0001
+  },
+  "run": {
+    "output_dir": "runs/fp32_3",
+    "resume": false,
+    "seed": 0
+  },
+  "stages": [
+    {
+      "cleanup_hidden_channels": 32,
+      "depth": 12,
+      "image_size": 256,
+      "in_channels": 1,
+      "mlp_dim": 512,
+      "n_heads": 8,
+      "out_channels": 1,
+      "patch_size": 8,
+      "precision": "fp32",
+      "stage": 1,
+      "width": 128
+    }
+  ]
+}

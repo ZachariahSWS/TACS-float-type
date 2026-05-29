@@ -6,12 +6,19 @@ from typing import Optional
 import tomllib
 
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 VALID_PRECISIONS = {"fp32", "bf16"}
 
 
 def _optional_float(value: object) -> Optional[float]:
     return None if value is None else float(value)
+
+
+def _grad_clip_norm(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    out = float(value)
+    return None if out < 0.0 else out
 
 
 def _optional_int(raw: dict, key: str) -> Optional[int]:
@@ -71,7 +78,7 @@ class OptimizationConfig:
     epochs: int = 50
     lr: float = 1e-4
     weight_decay: float = 1e-4
-    grad_clip_norm: Optional[float] = 1.0
+    grad_clip_norm: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -149,7 +156,7 @@ class TrainConfig:
                 epochs=int(optimization_raw.get("epochs", 50)),
                 lr=float(optimization_raw.get("lr", 1e-4)),
                 weight_decay=float(optimization_raw.get("weight_decay", 1e-4)),
-                grad_clip_norm=_optional_float(optimization_raw.get("grad_clip_norm", 1.0)),
+                grad_clip_norm=_grad_clip_norm(optimization_raw.get("grad_clip_norm", -1.0)),
             ),
             loader=LoaderConfig(
                 num_workers=int(loader_raw.get("num_workers", 4)),

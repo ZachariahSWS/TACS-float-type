@@ -27,41 +27,63 @@ def channel_last_norm(x: Tensor, norm: RMSNorm) -> Tensor:
     return y.transpose(1, 2).reshape(batch, channels, height, width)
 
 
-def rope_freqs(dim: int, theta: float, device: torch.device) -> Tensor:
-    idx = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-    return 1.0 / (theta ** (idx / float(dim)))
+class RoPE2D(nn.Module):
+    def __init__(self, grid_size: int, d_head: int, theta: float = 32.0) -> None:
+        super().__init__()
+        if d_head % 4 != 0:
+            raise ValueError(f"d_head={d_head} must be divisible by 4 for 2D RoPE")
 
+        self.grid_size = int(grid_size)
+        self.d_head = int(d_head)
+        self.theta = float(theta)
 
-def apply_rope_1d(x: Tensor, freqs: Tensor, pos: Tensor) -> Tensor:
-    x_even = x[..., 0::2].to(dtype=torch.float32)
-    x_odd = x[..., 1::2].to(dtype=torch.float32)
+        n_tokens = self.grid_size * self.grid_size
+        d_axis = self.d_head // 2
+        idx = torch.arange(0, d_axis, 2, dtype=torch.float32)
+        freqs = 1.0 / (self.theta ** (idx / float(d_axis)))
+        pos = torch.arange(n_tokens, dtype=torch.int64)
+        rows = (pos // self.grid_size).to(dtype=torch.float32)
+        cols = (pos % self.grid_size).to(dtype=torch.float32)
 
-    angles = pos.to(dtype=torch.float32).unsqueeze(-1) * freqs.unsqueeze(0)
-    cos = torch.cos(angles).unsqueeze(0).unsqueeze(2)
-    sin = torch.sin(angles).unsqueeze(0).unsqueeze(2)
+        row_angles = rows.unsqueeze(1) * freqs.unsqueeze(0)
+        col_angles = cols.unsqueeze(1) * freqs.unsqueeze(0)
+        self.register_buffer("row_cos", torch.cos(row_angles).unsqueeze(0).unsqueeze(2), persistent=False)
+        self.register_buffer("row_sin", torch.sin(row_angles).unsqueeze(0).unsqueeze(2), persistent=False)
+        self.register_buffer("col_cos", torch.cos(col_angles).unsqueeze(0).unsqueeze(2), persistent=False)
+        self.register_buffer("col_sin", torch.sin(col_angles).unsqueeze(0).unsqueeze(2), persistent=False)
 
-    y_even = x_even * cos - x_odd * sin
-    y_odd = x_even * sin + x_odd * cos
-    y = torch.stack([y_even, y_odd], dim=-1).reshape(*x.shape)
-    return y.to(dtype=x.dtype)
+    @staticmethod
+    def _apply_axis(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        x_even = x[..., 0::2].to(dtype=torch.float32)
+        x_odd = x[..., 1::2].to(dtype=torch.float32)
+        y_even = x_even * cos - x_odd * sin
+        y_odd = x_even * sin + x_odd * cos
+        y = torch.stack((y_even, y_odd), dim=-1).flatten(-2)
+        return y.to(dtype=x.dtype)
 
-
-def apply_2d_rope(q: Tensor, k: Tensor, width: int, theta: float) -> tuple[Tensor, Tensor]:
-    n_tokens = q.shape[1]
-    d_half = q.shape[-1] // 2
-
-    rows = torch.arange(n_tokens, device=q.device, dtype=torch.int64) // width
-    cols = torch.arange(n_tokens, device=q.device, dtype=torch.int64) % width
-    row_freqs = rope_freqs(d_half, theta=theta, device=q.device)
-    col_freqs = rope_freqs(d_half, theta=theta, device=q.device)
-
-    q = torch.cat([apply_rope_1d(q[..., :d_half], row_freqs, rows), apply_rope_1d(q[..., d_half:], col_freqs, cols)], dim=-1)
-    k = torch.cat([apply_rope_1d(k[..., :d_half], row_freqs, rows), apply_rope_1d(k[..., d_half:], col_freqs, cols)], dim=-1)
-    return q, k
+    def forward(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+        if q.shape[1] != self.grid_size * self.grid_size:
+            raise ValueError(f"Expected {self.grid_size * self.grid_size} tokens, got {q.shape[1]}")
+        d_axis = self.d_head // 2
+        q = torch.cat(
+            (
+                self._apply_axis(q[..., :d_axis], self.row_cos, self.row_sin),
+                self._apply_axis(q[..., d_axis:], self.col_cos, self.col_sin),
+            ),
+            dim=-1,
+        )
+        k = torch.cat(
+            (
+                self._apply_axis(k[..., :d_axis], self.row_cos, self.row_sin),
+                self._apply_axis(k[..., d_axis:], self.col_cos, self.col_sin),
+            ),
+            dim=-1,
+        )
+        return q, k
 
 
 class ViTBlock(nn.Module):
-    def __init__(self, width: int, n_heads: int, mlp_dim: int, rope_theta: float = 32.0) -> None:
+    def __init__(self, width: int, n_heads: int, mlp_dim: int) -> None:
         super().__init__()
         if width % n_heads != 0:
             raise ValueError(f"width={width} must be divisible by n_heads={n_heads}")
@@ -76,7 +98,6 @@ class ViTBlock(nn.Module):
         self.width = int(width)
         self.n_heads = int(n_heads)
         self.d_head = int(d_head)
-        self.rope_theta = float(rope_theta)
 
         self.attn_norm = RMSNorm(width)
         self.qkv_proj = nn.Linear(width, 3 * width, bias=False)
@@ -88,13 +109,13 @@ class ViTBlock(nn.Module):
         self.up_proj = nn.Linear(width, mlp_dim, bias=False)
         self.down_proj = nn.Linear(mlp_dim, width, bias=False)
 
-    def attention(self, x: Tensor, width: int) -> Tensor:
+    def attention(self, x: Tensor, rope: RoPE2D) -> Tensor:
         qkv = self.qkv_proj(x).view(x.shape[0], x.shape[1], 3, self.n_heads, self.d_head)
         q = self.qk_norm(qkv[:, :, 0])
         k = self.qk_norm(qkv[:, :, 1])
         v = qkv[:, :, 2]
 
-        q, k = apply_2d_rope(q, k, width=width, theta=self.rope_theta)
+        q, k = rope(q, k)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -102,36 +123,58 @@ class ViTBlock(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         return y.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], self.width)
 
-    def forward(self, x: Tensor, width: int) -> Tensor:
-        x = x + self.out_proj(self.attention(self.attn_norm(x), width=width))
+    def forward(self, x: Tensor, rope: RoPE2D) -> Tensor:
+        x = x + self.out_proj(self.attention(self.attn_norm(x), rope=rope))
         y = self.ffn_norm(x)
         y = F.silu(self.gate_proj(y)) * self.up_proj(y)
         return x + self.down_proj(y)
 
 
 class Transformer2D(nn.Module):
-    def __init__(self, width: int, depth: int, n_heads: int, mlp_dim: int, rope_theta: float = 32.0) -> None:
+    def __init__(self, *, width: int, depth: int, n_heads: int, mlp_dim: int, grid_size: int, rope_theta: float = 32.0) -> None:
         super().__init__()
-        self.blocks = nn.ModuleList([ViTBlock(width=width, n_heads=n_heads, mlp_dim=mlp_dim, rope_theta=rope_theta) for _ in range(depth)])
+        if width % n_heads != 0:
+            raise ValueError(f"width={width} must be divisible by n_heads={n_heads}")
+        self.grid_size = int(grid_size)
+        self.rope = RoPE2D(grid_size=grid_size, d_head=width // n_heads, theta=rope_theta)
+        self.blocks = nn.ModuleList([ViTBlock(width=width, n_heads=n_heads, mlp_dim=mlp_dim) for _ in range(depth)])
 
     def forward(self, x: Tensor) -> Tensor:
         batch, channels, height, width = x.shape
+        if height != self.grid_size or width != self.grid_size:
+            raise ValueError(f"Expected patch grid {(self.grid_size, self.grid_size)}, got {(height, width)}")
         y = x.flatten(2).transpose(1, 2)
         for block in self.blocks:
-            y = block(y, width=width)
+            y = block(y, rope=self.rope)
         return y.transpose(1, 2).reshape(batch, channels, height, width)
 
 
 class SingleStepViTPredictor(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int = 1, image_size: int = 256, patch_size: int = 8, width: int = 128, depth: int = 12, n_heads: int = 8, mlp_dim: int = 512, cleanup_hidden_channels: int = 32) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = 1,
+        image_size: int = 256,
+        patch_size: int = 8,
+        width: int = 128,
+        depth: int = 12,
+        n_heads: int = 8,
+        mlp_dim: int = 512,
+        cleanup_hidden_channels: int = 32,
+    ) -> None:
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError(f"image_size={image_size} must be divisible by patch_size={patch_size}")
 
         self.image_size = int(image_size)
-        self.embed = nn.Sequential(
-            nn.PixelUnshuffle(int(patch_size)),
-            nn.Conv2d(in_channels * patch_size * patch_size, width, kernel_size=1, bias=False),
+        self.patch_size = int(patch_size)
+        self.grid_size = self.image_size // self.patch_size
+        self.embed = nn.Conv2d(
+            in_channels,
+            width,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=False,
         )
         self.embed_norm = RMSNorm(width)
         self.transformer = Transformer2D(
@@ -139,11 +182,12 @@ class SingleStepViTPredictor(nn.Module):
             depth=depth,
             n_heads=n_heads,
             mlp_dim=mlp_dim,
-            rope_theta=32.0
+            grid_size=self.grid_size,
+            rope_theta=32.0,
         )
         self.unpatchify = nn.Sequential(
-            nn.Conv2d(width, out_channels * patch_size * patch_size, kernel_size=1, bias=False),
-            nn.PixelShuffle(int(patch_size)),
+            nn.Conv2d(width, out_channels * self.patch_size * self.patch_size, kernel_size=1, bias=False),
+            nn.PixelShuffle(self.patch_size),
         )
         self.cleanup = nn.Sequential(
             nn.Conv2d(out_channels, cleanup_hidden_channels, kernel_size=3, padding=1),
