@@ -16,15 +16,14 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x32 = x.to(dtype=torch.float32)
-        y32 = x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        y32 = x32 * torch.rsqrt(x32.square().mean(dim=-1, keepdim=True) + self.eps)
         return (y32 * self.weight).to(dtype=x.dtype)
 
 
-def channel_last_norm(x: Tensor, norm: RMSNorm) -> Tensor:
-    batch, channels, height, width = x.shape
-    y = x.reshape(batch, channels, height * width).transpose(1, 2)
-    y = norm(y)
-    return y.transpose(1, 2).reshape(batch, channels, height, width)
+def channel_norm_2d(x: Tensor, norm: RMSNorm) -> Tensor:
+    x32 = x.to(dtype=torch.float32)
+    y32 = x32 * torch.rsqrt(x32.square().mean(dim=1, keepdim=True) + norm.eps)
+    return (y32 * norm.weight.view(1, -1, 1, 1)).to(dtype=x.dtype)
 
 
 class RoPE2D(nn.Module):
@@ -53,34 +52,24 @@ class RoPE2D(nn.Module):
         self.register_buffer("col_sin", torch.sin(col_angles).unsqueeze(0).unsqueeze(2), persistent=False)
 
     @staticmethod
-    def _apply_axis(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        x_even = x[..., 0::2].to(dtype=torch.float32)
-        x_odd = x[..., 1::2].to(dtype=torch.float32)
-        y_even = x_even * cos - x_odd * sin
-        y_odd = x_even * sin + x_odd * cos
-        y = torch.stack((y_even, y_odd), dim=-1).flatten(-2)
-        return y.to(dtype=x.dtype)
+    def _rotate_into(y: Tensor, x: Tensor, cos: Tensor, sin: Tensor) -> None:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        y[..., 0::2] = x_even * cos - x_odd * sin
+        y[..., 1::2] = x_even * sin + x_odd * cos
+
+    def _apply_rope(self, x: Tensor) -> Tensor:
+        x32 = x.to(dtype=torch.float32)
+        y32 = torch.empty_like(x32)
+        d_axis = self.d_head // 2
+        self._rotate_into(y32[..., :d_axis], x32[..., :d_axis], self.row_cos, self.row_sin)
+        self._rotate_into(y32[..., d_axis:], x32[..., d_axis:], self.col_cos, self.col_sin)
+        return y32.to(dtype=x.dtype)
 
     def forward(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
         if q.shape[1] != self.grid_size * self.grid_size:
             raise ValueError(f"Expected {self.grid_size * self.grid_size} tokens, got {q.shape[1]}")
-        d_axis = self.d_head // 2
-        q = torch.cat(
-            (
-                self._apply_axis(q[..., :d_axis], self.row_cos, self.row_sin),
-                self._apply_axis(q[..., d_axis:], self.col_cos, self.col_sin),
-            ),
-            dim=-1,
-        )
-        k = torch.cat(
-            (
-                self._apply_axis(k[..., :d_axis], self.row_cos, self.row_sin),
-                self._apply_axis(k[..., d_axis:], self.col_cos, self.col_sin),
-            ),
-            dim=-1,
-        )
-        return q, k
-
+        return self._apply_rope(q), self._apply_rope(k)
 
 class ViTBlock(nn.Module):
     def __init__(self, width: int, n_heads: int, mlp_dim: int) -> None:
@@ -143,7 +132,7 @@ class Transformer2D(nn.Module):
         batch, channels, height, width = x.shape
         if height != self.grid_size or width != self.grid_size:
             raise ValueError(f"Expected patch grid {(self.grid_size, self.grid_size)}, got {(height, width)}")
-        y = x.flatten(2).transpose(1, 2)
+        y = x.flatten(2).transpose(1, 2).contiguous()
         for block in self.blocks:
             y = block(y, rope=self.rope)
         return y.transpose(1, 2).reshape(batch, channels, height, width)
@@ -213,7 +202,7 @@ class SingleStepViTPredictor(nn.Module):
         if tuple(x.shape[-2:]) != (self.image_size, self.image_size):
             raise ValueError(f"Expected input spatial shape {(self.image_size, self.image_size)}, got {tuple(x.shape[-2:])}")
         x = self.embed(x)
-        x = channel_last_norm(x, self.embed_norm)
+        x = channel_norm_2d(x, self.embed_norm)
         x = self.transformer(x)
         x = self.unpatchify(x)
         return x + self.cleanup(x)

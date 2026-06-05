@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import h5py
 import numpy as np
 import torch
@@ -29,52 +27,48 @@ def resolve_field_dataset(h5_file: h5py.File, field: str) -> h5py.Dataset:
     raise KeyError(f"Field '{field}' not found. Available datasets: {available}")
 
 
-def squeeze_field_frame(array: np.ndarray) -> np.ndarray:
-    out = np.asarray(array, dtype=np.float32)
-    if out.ndim == 3 and out.shape[0] == 1:
-        out = out[0]
-    if out.ndim == 3 and out.shape[-1] == 1:
-        out = out[..., 0]
-    if out.ndim != 2:
-        raise ValueError(f"Expected a 2D field after squeezing singleton channels, got shape {out.shape}")
-    return out
+def load_field_frames_to_ram(data_path: str, field: str) -> Tensor:
+    """Load one HDF5 field into a contiguous float32 CPU tensor of shape [T, H, W]."""
+    with h5py.File(str(data_path), "r") as f:
+        ds = resolve_field_dataset(f, str(field))
+        array = np.asarray(ds[...], dtype=np.float32)
+
+    if array.ndim == 4 and array.shape[1] == 1:
+        array = array[:, 0]
+    elif array.ndim == 4 and array.shape[-1] == 1:
+        array = array[..., 0]
+
+    if array.ndim != 3:
+        raise ValueError(f"Expected field shape [T,H,W], [T,1,H,W], or [T,H,W,1], got {array.shape}")
+
+    return torch.from_numpy(np.ascontiguousarray(array))
 
 
 class PairedFieldDataset(Dataset):
-    def __init__(self, data_path: str, field: str, sample_start: int, sample_stop: int) -> None:
-        self.data_path = str(data_path)
-        self.field = str(field)
+    """Consecutive-frame pairs backed by one shared in-RAM [T, H, W] tensor."""
+
+    def __init__(self, frames: Tensor, sample_start: int, sample_stop: int) -> None:
+        if frames.ndim != 3:
+            raise ValueError(f"Expected frames with shape [T,H,W], got {tuple(frames.shape)}")
+        if frames.dtype != torch.float32:
+            raise ValueError(f"Expected float32 frames, got {frames.dtype}")
+        if not frames.is_contiguous():
+            frames = frames.contiguous()
+
+        self.frames = frames
         self.sample_start = int(sample_start)
         self.sample_stop = int(sample_stop)
-        self._file: Optional[h5py.File] = None
-        self._dataset: Optional[h5py.Dataset] = None
 
-        with h5py.File(self.data_path, "r") as f:
-            ds = resolve_field_dataset(f, self.field)
-            total_frames = int(ds.shape[0])
-            example = squeeze_field_frame(ds[self.sample_start])
-
+        total_frames = int(frames.shape[0])
         if not (0 <= self.sample_start < self.sample_stop <= total_frames):
             raise ValueError(f"Invalid slice [{self.sample_start}:{self.sample_stop}] for dataset length {total_frames}")
         if self.sample_stop - self.sample_start < 2:
             raise ValueError("Need at least 2 frames to form one consecutive pair.")
 
-        self.length = self.sample_stop - self.sample_start - 1
-        self.height, self.width = map(int, example.shape)
-
-    def _ensure_open(self) -> None:
-        if self._file is None:
-            self._file = h5py.File(self.data_path, "r")
-            self._dataset = resolve_field_dataset(self._file, self.field)
-
-    def close(self) -> None:
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-            self._dataset = None
-
-    def __del__(self) -> None:
-        self.close()
+        self.indices = torch.arange(self.sample_start, self.sample_stop - 1, dtype=torch.long)
+        self.length = int(self.indices.numel())
+        self.height = int(frames.shape[1])
+        self.width = int(frames.shape[2])
 
     def __len__(self) -> int:
         return self.length
@@ -83,11 +77,5 @@ class PairedFieldDataset(Dataset):
         if not (0 <= idx < self.length):
             raise IndexError(idx)
 
-        self._ensure_open()
-        assert self._dataset is not None
-
-        i0 = self.sample_start + idx
-        i1 = i0 + 1
-        x0 = torch.from_numpy(squeeze_field_frame(self._dataset[i0])).unsqueeze(0)
-        x1 = torch.from_numpy(squeeze_field_frame(self._dataset[i1])).unsqueeze(0)
-        return x0.to(dtype=torch.float32), x1.to(dtype=torch.float32)
+        i = int(self.indices[idx])
+        return self.frames[i].unsqueeze(0), self.frames[i + 1].unsqueeze(0)

@@ -112,12 +112,22 @@ def save_checkpoint_payload(path: str, payload: dict) -> None:
             os.remove(tmp_path)
 
 
-def save_best_checkpoint(*, path: str, stage_config: StageConfig, model: torch.nn.Module, target_norm: TargetNorm, epoch: int, best_val_real_mse: float) -> None:
+def save_best_checkpoint(
+    *,
+    path: str,
+    stage_config: StageConfig,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    target_norm: TargetNorm,
+    epoch: int,
+    best_val_real_mse: float,
+) -> None:
     save_checkpoint_payload(
         path,
         checkpoint_payload(
             stage_config=stage_config,
             model=model,
+            optimizer=optimizer,
             target_norm=target_norm,
             epoch=epoch,
             best_val_real_mse=best_val_real_mse,

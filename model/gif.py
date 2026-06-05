@@ -23,16 +23,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="rollout.gif")
     parser.add_argument("--clip_low", type=float, default=1.0)
     parser.add_argument("--clip_high", type=float, default=99.0)
+    parser.add_argument("--cmap", type=str, default="bwr")
     return parser.parse_args()
 
 
-def save_gif(frames: np.ndarray, out_path: str, fps: int, percentile_clip: tuple[float, float]) -> None:
+def save_gif(frames: np.ndarray, out_path: str, fps: int, percentile_clip: tuple[float, float], cmap: str) -> None:
     lo, hi = percentile_clip
-    vmin = float(np.percentile(frames, lo))
-    vmax = float(np.percentile(frames, hi))
+    lower = float(np.percentile(frames, lo))
+    upper = float(np.percentile(frames, hi))
+    vmax_abs = max(abs(lower), abs(upper))
+    if vmax_abs == 0.0:
+        vmax_abs = 1.0
+    vmin = -vmax_abs
+    vmax = vmax_abs
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(frames[0], origin="lower", vmin=vmin, vmax=vmax)
+    im = ax.imshow(frames[0], origin="lower", vmin=vmin, vmax=vmax, cmap=cmap)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     title = ax.set_title("rollout step 0")
@@ -65,6 +71,7 @@ def main() -> None:
         out_path=args.output,
         fps=args.fps,
         percentile_clip=(args.clip_low, args.clip_high),
+        cmap=args.cmap,
     )
 
 

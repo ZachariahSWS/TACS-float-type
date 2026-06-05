@@ -42,7 +42,7 @@ def stacked_targets(sequence: np.ndarray, horizons: tuple[int, ...], n_starts: i
 
 
 def safe_ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
-    return np.divide(num, den, out=np.ones_like(num), where=den > 0.0)
+    return np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0.0)
 
 
 def spectrum_relative_l2(pred_spec: np.ndarray, true_spec: np.ndarray) -> np.ndarray:
@@ -58,14 +58,36 @@ def save_ratio_plot(path: str, ratio: np.ndarray, title: str) -> None:
 
     plt.figure(figsize=(7, 5))
     if np.any(mask):
-        plt.loglog(k[mask], ratio[mask])
-        plt.axhline(1.0, linestyle="--", linewidth=1.0)
+        plt.loglog(k[mask], ratio[mask], color="tab:red")
+        plt.axhline(1.0, color="black", linestyle="--", linewidth=1.0)
     else:
-        plt.plot(k, ratio)
-        plt.axhline(1.0, linestyle="--", linewidth=1.0)
+        plt.plot(k, ratio, color="tab:red")
+        plt.axhline(1.0, color="black", linestyle="--", linewidth=1.0)
     plt.xlabel("Wavenumber k")
     plt.ylabel("Prediction / truth")
     plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def save_absolute_spectrum_plot(path: str, prediction: np.ndarray, truth: np.ndarray, title: str, ylabel: str) -> None:
+    k = np.arange(len(truth))
+    pred_mask = (k > 0) & np.isfinite(prediction) & (prediction > 0)
+    truth_mask = (k > 0) & np.isfinite(truth) & (truth > 0)
+
+    plt.figure(figsize=(7, 5))
+    if np.any(truth_mask):
+        plt.loglog(k[truth_mask], truth[truth_mask], color="tab:blue", label="truth")
+    if np.any(pred_mask):
+        plt.loglog(k[pred_mask], prediction[pred_mask], color="tab:red", label="prediction")
+    if not np.any(truth_mask) and not np.any(pred_mask):
+        plt.plot(k, truth, color="tab:blue", label="truth")
+        plt.plot(k, prediction, color="tab:red", label="prediction")
+    plt.xlabel("Wavenumber k")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
@@ -139,6 +161,20 @@ def main() -> None:
         hdir = os.path.join(args.output_dir, f"horizon_{horizon}")
         os.makedirs(hdir, exist_ok=True)
 
+        save_absolute_spectrum_plot(
+            os.path.join(hdir, "tke_spectrum.png"),
+            tke_pred[idx],
+            tke_true[idx],
+            f"TKE spectrum, horizon {horizon}",
+            "TKE shell sum",
+        )
+        save_absolute_spectrum_plot(
+            os.path.join(hdir, "enstrophy_spectrum.png"),
+            enstrophy_pred[idx],
+            enstrophy_true[idx],
+            f"Enstrophy spectrum, horizon {horizon}",
+            "Enstrophy shell sum",
+        )
         save_ratio_plot(os.path.join(hdir, "tke_ratio.png"), tke_ratio[idx], f"TKE spectrum ratio, horizon {horizon}")
         save_ratio_plot(os.path.join(hdir, "enstrophy_ratio.png"), enstrophy_ratio[idx], f"Enstrophy spectrum ratio, horizon {horizon}")
 

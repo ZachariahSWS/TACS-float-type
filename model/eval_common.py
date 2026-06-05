@@ -7,11 +7,27 @@ import h5py
 import numpy as np
 import torch
 
+try:
+    import scipy.fft as scipy_fft
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments
+    scipy_fft = None
+
 from runtime import StageBundle, load_stage_bundle, predict_cascade, resolve_stage_paths
-from utils import resolve_field_dataset, squeeze_field_frame
+from utils import resolve_field_dataset
 
 
 Tensor = torch.Tensor
+
+
+def squeeze_field_frame(array: np.ndarray) -> np.ndarray:
+    out = np.asarray(array, dtype=np.float32)
+    if out.ndim == 3 and out.shape[0] == 1:
+        out = out[0]
+    if out.ndim == 3 and out.shape[-1] == 1:
+        out = out[..., 0]
+    if out.ndim != 2:
+        raise ValueError(f"Expected a 2D field after squeezing singleton channels, got shape {out.shape}")
+    return out
 
 
 @dataclass(frozen=True)
@@ -154,11 +170,11 @@ def rollout_trajectory_to_cpu(
 
 
 def make_spectrum_geometry(height: int, width: int) -> SpectrumGeometry:
-    ky = np.fft.fftfreq(height) * height
-    kx = np.fft.fftfreq(width) * width
+    ky = (np.fft.fftfreq(height) * height).astype(np.float32)
+    kx = (np.fft.fftfreq(width) * width).astype(np.float32)
     kyg, kxg = np.meshgrid(ky, kx, indexing="ij")
-    k2 = kxg * kxg + kyg * kyg
-    bins = np.rint(np.sqrt(k2)).astype(np.int32)
+    k2 = (kxg * kxg + kyg * kyg).astype(np.float32, copy=False)
+    bins = np.rint(np.sqrt(k2, dtype=np.float32)).astype(np.int32)
     bins_flat = bins.ravel()
     bin_order = np.argsort(bins_flat, kind="stable")
     sorted_bins = bins_flat[bin_order]
@@ -182,36 +198,50 @@ def radial_reduce(density: np.ndarray, geometry: SpectrumGeometry) -> np.ndarray
     if density.shape[-2:] != (geometry.height, geometry.width):
         raise ValueError(f"Expected trailing shape {(geometry.height, geometry.width)}, got {density.shape[-2:]}")
 
+    density = np.asarray(density, dtype=np.float32)
     flat = density.reshape(-1, geometry.height * geometry.width)
     sorted_density = flat[:, geometry.bin_order]
     reduced = np.add.reduceat(sorted_density, geometry.bin_starts, axis=1)
 
-    out = np.zeros((flat.shape[0], geometry.n_bins), dtype=np.float64)
+    out = np.zeros((flat.shape[0], geometry.n_bins), dtype=np.float32)
     out[:, geometry.unique_bins] = reduced
     return out.reshape(*density.shape[:-2], geometry.n_bins)
 
 
 def spectra_from_fft(omega_hat: np.ndarray, geometry: SpectrumGeometry) -> tuple[np.ndarray, np.ndarray]:
-    enstrophy_density = 0.5 * np.abs(omega_hat) ** 2
+    omega_hat = np.asarray(omega_hat, dtype=np.complex64)
+    enstrophy_density = (np.float32(0.5) * np.square(np.abs(omega_hat), dtype=np.float32)).astype(np.float32, copy=False)
 
-    psi_hat = np.zeros_like(omega_hat, dtype=np.complex128)
+    psi_hat = np.zeros_like(omega_hat, dtype=np.complex64)
     psi_hat[..., geometry.nonzero] = -omega_hat[..., geometry.nonzero] / geometry.k2[geometry.nonzero]
-    u_hat = 1j * geometry.kyg * psi_hat
-    v_hat = -1j * geometry.kxg * psi_hat
-    tke_density = 0.5 * (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2)
+
+    u_hat = np.complex64(1j) * geometry.kyg * psi_hat
+    v_hat = -np.complex64(1j) * geometry.kxg * psi_hat
+    tke_density = (
+        np.float32(0.5)
+        * (np.square(np.abs(u_hat), dtype=np.float32) + np.square(np.abs(v_hat), dtype=np.float32))
+    ).astype(np.float32, copy=False)
 
     tke = radial_reduce(tke_density, geometry)
     enstrophy = radial_reduce(enstrophy_density, geometry)
     return tke, enstrophy
 
 
+def _fft2_complex64(fields: np.ndarray) -> np.ndarray:
+    fields_f32 = np.ascontiguousarray(fields, dtype=np.float32)
+    if scipy_fft is not None:
+        return np.asarray(scipy_fft.fft2(fields_f32, axes=(-2, -1), workers=-1), dtype=np.complex64)
+
+    tensor = torch.from_numpy(fields_f32)
+    return torch.fft.fft2(tensor, dim=(-2, -1)).numpy().astype(np.complex64, copy=False)
+
+
 def batched_spectra(fields: np.ndarray, geometry: SpectrumGeometry) -> tuple[np.ndarray, np.ndarray]:
     if fields.shape[-2:] != (geometry.height, geometry.width):
         raise ValueError(f"Expected trailing shape {(geometry.height, geometry.width)}, got {fields.shape[-2:]}")
 
-    omega_hat = np.fft.fft2(fields.astype(np.float64, copy=False), axes=(-2, -1))
+    omega_hat = _fft2_complex64(fields)
     return spectra_from_fft(omega_hat, geometry)
-
 
 def relative_l2_by_horizon(predictions: np.ndarray, targets: np.ndarray) -> np.ndarray:
     diff = predictions.astype(np.float64, copy=False) - targets.astype(np.float64, copy=False)

@@ -32,7 +32,7 @@ from runtime import (
     unnormalize_target,
     write_json,
 )
-from utils import PairedFieldDataset
+from utils import PairedFieldDataset, load_field_frames_to_ram
 
 
 Tensor = torch.Tensor
@@ -59,13 +59,26 @@ def configure_torch() -> None:
     torch.set_float32_matmul_precision("high")
 
 
+def make_optimizer(model: torch.nn.Module, config: TrainConfig, device: torch.device) -> torch.optim.Optimizer:
+    kwargs = dict(
+        lr=config.optimization.lr,
+        weight_decay=config.optimization.weight_decay,
+    )
+    if device.type == "cuda":
+        try:
+            return torch.optim.AdamW(model.parameters(), **kwargs, fused=True)
+        except TypeError:
+            return torch.optim.AdamW(model.parameters(), **kwargs, foreach=True)
+    return torch.optim.AdamW(model.parameters(), **kwargs)
+
+
 def make_dataloader(
     dataset: Dataset,
     batch_size: int,
     shuffle: bool,
     loader_config: LoaderConfig,
     pin_memory: bool,
-    generator: torch.Generator | None = None,
+    drop_last: bool = False,
 ) -> DataLoader:
     kwargs = dict(
         dataset=dataset,
@@ -74,8 +87,7 @@ def make_dataloader(
         num_workers=loader_config.num_workers,
         pin_memory=pin_memory,
         persistent_workers=loader_config.persistent_workers and loader_config.num_workers > 0,
-        drop_last=False,
-        generator=generator,
+        drop_last=drop_last,
     )
     if loader_config.num_workers > 0:
         kwargs["prefetch_factor"] = loader_config.prefetch_factor
@@ -131,13 +143,13 @@ def model_forward(model: torch.nn.Module, model_input_f32: Tensor, stage_config:
 def estimate_target_norm(*, dataset: Dataset, batch_size: int, loader_config: LoaderConfig, stage_config: StageConfig, previous_bundles: list[StageBundle], device: torch.device) -> TargetNorm:
     loader = make_dataloader(dataset, batch_size=batch_size, shuffle=False, loader_config=loader_config, pin_memory=False)
 
-    total_sum = torch.zeros((), device=device, dtype=torch.float64)
-    total_sq_sum = torch.zeros((), device=device, dtype=torch.float64)
+    total_sum = torch.zeros((), device=device, dtype=torch.float32)
+    total_sq_sum = torch.zeros((), device=device, dtype=torch.float32)
     total_count = 0
     for batch in loader:
         x0_f32, x1_f32 = move_batch_to_device(batch, device)
         model_input = build_stage_input(stage=stage_config.stage, previous_bundles=previous_bundles, x0_f32=x0_f32, device=device)
-        target = residual_target_from_input(model_input, x1_f32).to(dtype=torch.float64)
+        target = residual_target_from_input(model_input, x1_f32)
         total_sum += target.sum()
         total_sq_sum += target.square().sum()
         total_count += int(target.numel())
@@ -206,12 +218,11 @@ def train_one_epoch(
     stage_config: StageConfig,
     previous_bundles: list[StageBundle],
     target_norm: TargetNorm,
-    grad_clip_norm: float | None,
     noise_std: float,
     noise_generator: torch.Generator,
 ) -> float:
     model.train(True)
-    total_loss = torch.zeros((), device=device, dtype=torch.float64)
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
     total_examples = 0
 
     for batch in dataloader:
@@ -227,12 +238,10 @@ def train_one_epoch(
         loss = F.mse_loss(pred_normed.to(dtype=torch.float32), target_normed)
         loss.backward()
 
-        if grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         batch_size = int(model_input_f32.shape[0])
-        total_loss += loss.detach().to(dtype=torch.float64) * batch_size
+        total_loss += loss.detach() * batch_size
         total_examples += batch_size
 
     return float((total_loss / max(total_examples, 1)).item())
@@ -241,7 +250,7 @@ def train_one_epoch(
 @torch.inference_mode()
 def eval_one_epoch(*, model: torch.nn.Module, dataloader: DataLoader, device: torch.device, stage_config: StageConfig, previous_bundles: list[StageBundle], target_norm: TargetNorm) -> float:
     model.train(False)
-    total_sq_error = torch.zeros((), device=device, dtype=torch.float64)
+    total_sq_error = torch.zeros((), device=device, dtype=torch.float32)
     total_elements = 0
 
     for batch in dataloader:
@@ -250,7 +259,7 @@ def eval_one_epoch(*, model: torch.nn.Module, dataloader: DataLoader, device: to
         pred_normed = model_forward(model, model_input_f32, stage_config=stage_config, device=device)
         pred_residual = unnormalize_target(pred_normed.to(dtype=torch.float32), target_norm)
         pred_full = reconstruct_full_prediction(model_input_f32, pred_residual)
-        sq_error = (pred_full - x1_f32).to(dtype=torch.float64).square().sum()
+        sq_error = (pred_full - x1_f32).square().sum()
         total_sq_error += sq_error
         total_elements += int(x1_f32.numel())
 
@@ -259,7 +268,7 @@ def eval_one_epoch(*, model: torch.nn.Module, dataloader: DataLoader, device: to
 
 def train_stage(*, config: TrainConfig, stage_config: StageConfig, train_dataset: Dataset, val_dataset: Dataset, previous_bundles: list[StageBundle], device: torch.device) -> StageBundle:
     model = build_stage_model(stage_config).to(device=device, dtype=torch.float32)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.optimization.lr, weight_decay=config.optimization.weight_decay)
+    optimizer = make_optimizer(model, config, device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"stage{stage_config.stage}: params={n_params:,} config={asdict(stage_config)}")
@@ -298,23 +307,20 @@ def train_stage(*, config: TrainConfig, stage_config: StageConfig, train_dataset
         )
 
     pin_memory = config.loader.pin_memory and device.type == "cuda"
+    train_loader = make_dataloader(
+        train_dataset,
+        config.optimization.batch_size,
+        True,
+        config.loader,
+        pin_memory,
+        drop_last=True,
+    )
     val_loader = make_dataloader(val_dataset, config.optimization.batch_size, False, config.loader, pin_memory)
     stage_start_time = time.perf_counter()
 
     for epoch in range(start_epoch, config.optimization.epochs):
         base_noise_std = 0.0 if previous_val_mse is None else math.sqrt(max(previous_val_mse, 0.0))
         noise_std = config.noise.noise_scale * base_noise_std
-
-        shuffle_generator = torch.Generator()
-        shuffle_generator.manual_seed(config.run.seed + 10_000 * stage_config.stage + epoch)
-        train_loader = make_dataloader(
-            train_dataset,
-            config.optimization.batch_size,
-            True,
-            config.loader,
-            pin_memory,
-            generator=shuffle_generator,
-        )
         noise_generator = make_noise_generator(device, config.noise.mask_seed + 1_000_000 * stage_config.stage + epoch)
 
         train_loss = train_one_epoch(
@@ -325,7 +331,6 @@ def train_stage(*, config: TrainConfig, stage_config: StageConfig, train_dataset
             stage_config=stage_config,
             previous_bundles=previous_bundles,
             target_norm=target_norm,
-            grad_clip_norm=config.optimization.grad_clip_norm,
             noise_std=noise_std,
             noise_generator=noise_generator,
         )
@@ -355,6 +360,7 @@ def train_stage(*, config: TrainConfig, stage_config: StageConfig, train_dataset
                 path=best_path,
                 stage_config=stage_config,
                 model=model,
+                optimizer=optimizer,
                 target_norm=target_norm,
                 epoch=epoch,
                 best_val_real_mse=best_val_mse,
@@ -376,15 +382,15 @@ def train_stage(*, config: TrainConfig, stage_config: StageConfig, train_dataset
 @torch.inference_mode()
 def evaluate_cascade(*, source_dataset: PairedFieldDataset, stage_bundles: list[StageBundle], batch_size: int, loader_config: LoaderConfig, device: torch.device) -> dict:
     loader = make_dataloader(source_dataset, batch_size, False, loader_config, pin_memory=(device.type == "cuda"))
-    total_model_sq_error = torch.zeros((), device=device, dtype=torch.float64)
-    total_persistence_sq_error = torch.zeros((), device=device, dtype=torch.float64)
+    total_model_sq_error = torch.zeros((), device=device, dtype=torch.float32)
+    total_persistence_sq_error = torch.zeros((), device=device, dtype=torch.float32)
     total_elements = 0
 
     for batch in loader:
         x0_f32, x1_f32 = move_batch_to_device(batch, device)
         pred, _ = predict_cascade(stage_bundles, x0_f32, device=device)
-        model_sq_error = (pred - x1_f32).to(dtype=torch.float64).square().sum()
-        persistence_sq_error = (x0_f32 - x1_f32).to(dtype=torch.float64).square().sum()
+        model_sq_error = (pred - x1_f32).square().sum()
+        persistence_sq_error = (x0_f32 - x1_f32).square().sum()
         total_model_sq_error += model_sq_error
         total_persistence_sq_error += persistence_sq_error
         total_elements += int(x1_f32.numel())
@@ -430,8 +436,9 @@ def validate_config_and_data(config: TrainConfig, train_base: PairedFieldDataset
 
 
 def load_base_datasets(config: TrainConfig) -> tuple[PairedFieldDataset, PairedFieldDataset]:
-    train_base = PairedFieldDataset(config.data.data_path, config.data.field, config.data.train_start, config.data.train_stop)
-    val_base = PairedFieldDataset(config.data.data_path, config.data.field, config.data.val_start, config.data.val_stop)
+    frames = load_field_frames_to_ram(config.data.data_path, config.data.field)
+    train_base = PairedFieldDataset(frames, config.data.train_start, config.data.train_stop)
+    val_base = PairedFieldDataset(frames, config.data.val_start, config.data.val_stop)
     validate_config_and_data(config, train_base, val_base)
     return train_base, val_base
 
