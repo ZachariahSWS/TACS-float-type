@@ -1,0 +1,66 @@
+config_version = 1
+
+[data]
+cadence_hours = 4
+
+[paths]
+dataset_root = "../data/pipeline_lucie3d_test"
+tokenizer_run = "runs/lucie3d_test_tokenizer"
+tokenizer_checkpoint = "runs/lucie3d_test_tokenizer/best.pt"
+token_root = "../data/tokens_lucie3d_test"
+dynamics_run = "runs/lucie3d_test_dynamics"
+dynamics_checkpoint = "runs/lucie3d_test_dynamics/best.pt"
+
+[runtime]
+device = "auto"
+precision = "auto"
+seed = 0
+resume = true
+performance_mode = true
+compile = true
+compile_mode = "default"
+num_workers = 2
+prefetch_factor = 2
+shuffle_block = 256
+validation_batches = 16
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+scale_loss_weights = [0.05, 0.10, 0.15, 0.25, 0.45]
+commitment_weight = 0.25
+
+[optimization]
+batch_size = 2
+gradient_accumulation = 4
+epochs = 100
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 32
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = true
+
+[dynamics_optimization]
+batch_size = 4
+gradient_accumulation = 4
+epochs = 100
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

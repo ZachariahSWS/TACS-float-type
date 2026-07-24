@@ -1,0 +1,68 @@
+config_version = 1
+
+[data]
+cadence_hours = 4
+
+[paths]
+dataset_root = "../data/pipeline_lucie3d_test"
+tokenizer_run = "runs/profile_lucie3d_5070_kernels_eager"
+tokenizer_checkpoint = "runs/profile_lucie3d_5070_kernels_eager/best.pt"
+token_root = "../data/tokens_profile_lucie3d_5070_kernels"
+dynamics_run = "runs/profile_lucie3d_dynamics_5070"
+dynamics_checkpoint = "runs/profile_lucie3d_dynamics_5070/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "bf16"
+seed = 0
+resume = false
+performance_mode = true
+compile = false
+num_workers = 2
+prefetch_factor = 2
+shuffle_block = 256
+validation_batches = 4
+max_train_frames = 256
+max_val_frames = 64
+profile_active_steps = 10
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+scale_loss_weights = [0.05, 0.10, 0.15, 0.25, 0.45]
+commitment_weight = 0.25
+
+[optimization]
+batch_size = 2
+gradient_accumulation = 4
+epochs = 1
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 32
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = true
+
+[dynamics_optimization]
+batch_size = 4
+gradient_accumulation = 4
+epochs = 1
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+
+[evaluation]
+batch_size = 8
+maximum_batches = 4

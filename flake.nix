@@ -1,19 +1,30 @@
 {
-  description = "TACS dev shell";
+  description = "TACS development environment";
 
-  inputs.dev.url = "path:/home/zach/nix-devshells";
+  inputs.dev.url = "path:/home/zach/nixos-config/devshells";
 
-  outputs = { self, dev }:
-  let
-    system = "x86_64-linux";
+  outputs = { dev, ... }:
+    let
+      system = "x86_64-linux";
 
-    env = dev.lib.${system}.mkProject {
-      name = "tacs";
-      claude = true;
+      project = dev.lib.${system}.mkProject {
+        name = "tacs";
+        extraShellHook = ''
+          if [ -x "$NIX_DEV_ROOT/.cuda-shim/ptxas" ]; then
+            export TRITON_PTXAS_PATH="$NIX_DEV_ROOT/.cuda-shim/ptxas"
+          elif [ -x "$CUDA_HOME/bin/ptxas" ]; then
+            export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
+          fi
+
+          if [ -x "$NIX_DEV_ROOT/.cuda-shim/ptxas-blackwell" ]; then
+            export TRITON_PTXAS_BLACKWELL_PATH="$NIX_DEV_ROOT/.cuda-shim/ptxas-blackwell"
+          elif [ -x "$CUDA_HOME/bin/ptxas" ]; then
+            export TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"
+          fi
+        '';
+      };
+    in
+    {
+      devShells.${system}.default = project.devShell;
     };
-  in
-  {
-    devShells.${system}.default = env.devShell;
-    packages.${system} = env.packages;
-  };
 }

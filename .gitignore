@@ -18,6 +18,8 @@ flake.lock
 # Experiment outputs
 runs/
 py2d_output/
+*.tar.gz
+*.tar.gz.sha256
 
 # Generated figures / animations
 *.gif
@@ -35,3 +37,6 @@ py2d_output/
 *.mat
 
 !10000.mat
+
+# Downloaded and derived LUCIE datasets
+/lucie/data/

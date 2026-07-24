@@ -1,0 +1,5 @@
+# Exact reference environment. Cluster installations may replace torch with the
+# site-supported CUDA build; every run records the actual versions in its manifest.
+h5py==3.16.0
+numpy==2.5.1
+torch==2.13.0
