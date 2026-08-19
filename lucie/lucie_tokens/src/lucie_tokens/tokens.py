@@ -8,11 +8,22 @@ from typing import Sequence
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
+from .data import SourceClimateFrameDataset
 from .runtime import atomic_json, autocast_context, resolve_device, resolve_precision
 from .schema import scale_offsets, split_flat_tokens
 from .tokenizer import ClimateTokenizer
+
+
+def _move_state(
+    state: torch.Tensor,
+    device: torch.device,
+    precision: str,
+) -> torch.Tensor:
+    if device.type == "cuda" and precision != "fp32":
+        return state.to(device, non_blocking=True)
+    return state.to(device, dtype=torch.float32, non_blocking=True)
 
 
 def load_tokenizer_checkpoint(
@@ -67,17 +78,17 @@ def tokenize_dataset(
         "total_tokens": total_tokens,
         "codebook_size": tokenizer.codebook_size,
         "cadence_hours": cadence_hours,
+        "source_kind": "direct_hourly_h5",
         "splits": {},
     }
     for split in splits:
-        split_summary: dict[str, object] = {"years": {}}
-        cache_files = sorted(
-            (dataset_root / f"cache_{cadence_hours}h" / split).glob("*.h5")
-        )
-        if not cache_files:
-            raise FileNotFoundError(f"No six-hour cache for split {split}")
-        for cache_path in cache_files:
-            destination = output_root / split / cache_path.name
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unknown split {split!r}")
+        else:
+            dataset = SourceClimateFrameDataset(
+                dataset_root, split, cadence_hours
+            )
+            destination = output_root / split / "source.h5"
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists() and not overwrite:
                 raise FileExistsError(
@@ -86,54 +97,85 @@ def tokenize_dataset(
             temporary = destination.with_name(
                 f"{destination.name}.tmp.{os.getpid()}"
             )
-            with h5py.File(cache_path, "r") as source:
-                length = len(source["timestamp"])
-                with h5py.File(temporary, "w") as target:
-                    tokens_ds = target.create_dataset(
-                        "tokens",
-                        shape=(length, total_tokens),
-                        dtype="u2",
-                        chunks=(min(batch_size, max(length, 1)), total_tokens),
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=device.type == "cuda",
+                persistent_workers=num_workers > 0,
+            )
+            timestamps = np.asarray(
+                [record[3] for record in dataset.records], dtype=np.int64
+            )
+            source_years = np.asarray(
+                [record[1] for record in dataset.records], dtype=np.int32
+            )
+            source_indices = np.asarray(
+                [record[2] for record in dataset.records], dtype=np.int32
+            )
+            # Pair each frame with the frame exactly cadence_hours later, when
+            # one exists. searchsorted keeps this correct regardless of the
+            # native frame spacing: on hourly data at cadence_hours=6 it pairs
+            # index i with i+6, and held-out years (gaps in the timestamps)
+            # drop out because no frame lands on the target timestamp.
+            target_timestamps = timestamps + cadence_hours * 3600
+            candidate = np.searchsorted(timestamps, target_timestamps)
+            matched = np.zeros(len(dataset), dtype=np.bool_)
+            in_range = candidate < len(timestamps)
+            matched[in_range] = (
+                timestamps[candidate[in_range]] == target_timestamps[in_range]
+            )
+            source = np.arange(len(dataset), dtype=np.int64)
+            transitions = np.stack(
+                [source[matched], candidate[matched]], axis=1
+            )
+            with h5py.File(temporary, "w") as target:
+                tokens_ds = target.create_dataset(
+                    "tokens",
+                    shape=(len(dataset), total_tokens),
+                    dtype="u2",
+                    chunks=(min(batch_size, len(dataset)), total_tokens),
+                )
+                start = 0
+                for state, _ in loader:
+                    state = _move_state(state, device, precision)
+                    with autocast_context(device, precision):
+                        pyramid = tokenizer.encode(state, update_ema=False)
+                    flat = (
+                        pyramid.flatten_indices()
+                        .to(dtype=torch.int32)
+                        .cpu()
+                        .numpy()
+                        .astype(np.uint16)
                     )
-                    for start in range(0, length, batch_size):
-                        stop = min(start + batch_size, length)
-                        state = torch.from_numpy(
-                            np.asarray(source["state_norm"][start:stop])
-                        ).to(device, non_blocking=True)
-                        with autocast_context(device, precision):
-                            pyramid = tokenizer.encode(state, update_ema=False)
-                        flat = (
-                            pyramid.flatten_indices()
-                            .to(dtype=torch.int32)
-                            .cpu()
-                            .numpy()
-                            .astype(np.uint16)
-                        )
-                        tokens_ds[start:stop] = flat
-                        if split == "train":
-                            offset = 0
-                            for scale_index, (height, width) in enumerate(scales):
-                                count = height * width
-                                used = np.unique(flat[:, offset : offset + count])
-                                masks[scale_index, used] = True
-                                offset += count
-                    target.create_dataset(
-                        "timestamp", data=np.asarray(source["timestamp"])
-                    )
-                    target.create_dataset(
-                        "source_index", data=np.asarray(source["source_index"])
-                    )
-                    target.create_dataset(
-                        "transitions", data=np.asarray(source["transitions"])
-                    )
-                    target.attrs["scales"] = json.dumps(scales)
-                    target.attrs["complete"] = True
+                    stop = start + len(flat)
+                    tokens_ds[start:stop] = flat
+                    if split == "train":
+                        offset = 0
+                        for scale_index, (height, width) in enumerate(scales):
+                            count = height * width
+                            used = np.unique(flat[:, offset : offset + count])
+                            masks[scale_index, used] = True
+                            offset += count
+                    start = stop
+                target.create_dataset("timestamp", data=timestamps)
+                target.create_dataset("source_index", data=source_indices)
+                target.create_dataset("source_year", data=source_years)
+                target.create_dataset("transitions", data=transitions)
+                target.attrs["scales"] = json.dumps(scales)
+                target.attrs["source_root"] = str(dataset_root)
+                target.attrs["complete"] = True
             os.replace(temporary, destination)
-            split_summary["years"][cache_path.stem] = {
-                "file": str(destination.relative_to(output_root)),
-                "frames": length,
+        summary["splits"][split] = {
+            "years": {
+                "source": {
+                    "file": str(destination.relative_to(output_root)),
+                    "frames": len(dataset),
+                    "transitions": len(transitions),
+                }
             }
-        summary["splits"][split] = split_summary
+        }
     if not masks.any():
         raise ValueError("Training split was not tokenized; cannot construct masks")
     np.save(output_root / "scale_masks.npy", masks)

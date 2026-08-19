@@ -13,6 +13,7 @@ dist/
 data/
 runs/
 profiles/
+configs/scratch/
 uv.lock
 benchmark.json
 source_report.json

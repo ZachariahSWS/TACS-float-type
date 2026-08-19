@@ -6,14 +6,20 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
 from .config import config_hash
-from .data import BlockShuffleBatchSampler, ClimateFrameDataset
+from .data import (
+    BlockShuffleBatchSampler,
+    FramePairDataset,
+    SourceClimateFrameDataset,
+    load_frame_dataset_manifest,
+    load_frame_grid,
+)
 from .dynamics import NextScaleDynamics, dynamics_loss
+from .noised_epochs import NoisedEpochPipeline
 from .runtime import (
     append_jsonl,
     atomic_json,
@@ -29,6 +35,12 @@ from .runtime import (
     software_manifest,
 )
 from .tokenizer import ClimateTokenizer, tokenizer_loss
+from .conditioning import (
+    ConditionedTokenPairDataset,
+    ForcingConditioner,
+    collate_conditioned_pairs,
+)
+from .schema import DEFAULT_SCALES
 from .tokens import TokenPairDataset, collate_token_pairs, load_tokenizer_checkpoint
 
 
@@ -132,7 +144,8 @@ def train_tokenizer(config: dict[str, Any]) -> Path:
     model_config = dict(config["tokenizer"])
     optimization = dict(config["optimization"])
     paths = dict(config["paths"])
-    cadence_hours = int(config.get("data", {}).get("cadence_hours", 6))
+    data_config = dict(config.get("data", {}))
+    cadence_hours = int(data_config.get("cadence_hours", 6))
     device = resolve_device(runtime.get("device", "auto"))
     precision = resolve_precision(runtime.get("precision", "auto"), device)
     configure_torch(bool(runtime.get("performance_mode", True)))
@@ -140,21 +153,19 @@ def train_tokenizer(config: dict[str, Any]) -> Path:
     dataset_root = Path(paths["dataset_root"])
     output_dir = Path(paths["tokenizer_run"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_manifest = json.loads((dataset_root / "manifest.json").read_text())
-    with h5py.File(dataset_root / "grid.h5", "r") as grid:
-        latitude_weights = torch.from_numpy(
-            np.asarray(grid["quadrature_weight"], dtype=np.float32)
-        ).to(device)
+    dataset_manifest = load_frame_dataset_manifest(dataset_root)
+    _, _, latitude_weight_values = load_frame_grid(dataset_root)
+    latitude_weights = torch.from_numpy(latitude_weight_values).to(device)
     train_dataset = _limit_dataset(
-        ClimateFrameDataset(dataset_root, "train", cadence_hours),
+        SourceClimateFrameDataset(dataset_root, "train", cadence_hours),
         runtime.get("max_train_frames"),
     )
     val_dataset = _limit_dataset(
-        ClimateFrameDataset(dataset_root, "val", cadence_hours),
+        SourceClimateFrameDataset(dataset_root, "val", cadence_hours),
         runtime.get("max_val_frames"),
     )
     batch_size = int(optimization["batch_size"])
-    if isinstance(train_dataset, ClimateFrameDataset):
+    if isinstance(train_dataset, SourceClimateFrameDataset):
         sampler = BlockShuffleBatchSampler(
             len(train_dataset),
             batch_size,
@@ -192,6 +203,9 @@ def train_tokenizer(config: dict[str, Any]) -> Path:
         ),
         state_channels=len(dataset_manifest["state_channels"]),
         grid_shape=tuple(dataset_manifest["grid_shape"]),
+        scales=tuple(
+            tuple(pair) for pair in model_config.get("scales", DEFAULT_SCALES)
+        ),
     ).to(device)
     optimizer = make_adamw(
         model.parameters(),
@@ -251,8 +265,14 @@ def train_tokenizer(config: dict[str, Any]) -> Path:
             device,
             enabled=epoch == start_epoch,
         ) as step_profiler:
+            final_window = len(train_loader) % accumulation
             for step, batch in enumerate(train_loader):
                 state = _move_state(batch, device, precision)
+                window_size = (
+                    final_window
+                    if final_window and step >= len(train_loader) - final_window
+                    else accumulation
+                )
                 with autocast_context(device, precision):
                     output = train_model(
                         state,
@@ -270,7 +290,7 @@ def train_tokenizer(config: dict[str, Any]) -> Path:
                             model_config.get("commitment_weight", 0.25)
                         ),
                     )
-                    scaled_loss = loss / accumulation
+                    scaled_loss = loss / window_size
                 scaler.scale(scaled_loss).backward()
                 if (step + 1) % accumulation == 0:
                     _optimizer_step(model, optimizer, scaler, gradient_clip)
@@ -323,6 +343,23 @@ def _move_token_pyramid(
     return tuple(value.to(device, non_blocking=True) for value in pyramid)
 
 
+def _unpack_dynamics_batch(batch, device: torch.device):
+    """Accept both plain (current, target) and conditioned
+    (current, target, conditioning) batches so the conditioned and
+    unconditioned training paths share one loop."""
+    if len(batch) == 3:
+        current, target, conditioning = batch
+        conditioning = conditioning.to(device, non_blocking=True)
+    else:
+        current, target = batch
+        conditioning = None
+    return (
+        _move_token_pyramid(current, device),
+        _move_token_pyramid(target, device),
+        conditioning,
+    )
+
+
 @torch.inference_mode()
 def _evaluate_dynamics(
     model: NextScaleDynamics,
@@ -334,13 +371,12 @@ def _evaluate_dynamics(
     model.eval()
     total = 0.0
     examples = 0
-    for batch_index, (current, target) in enumerate(loader):
+    for batch_index, batch in enumerate(loader):
         if batch_index >= maximum_batches:
             break
-        current = _move_token_pyramid(current, device)
-        target = _move_token_pyramid(target, device)
+        current, target, conditioning = _unpack_dynamics_batch(batch, device)
         with autocast_context(device, precision):
-            logits = model(current, target)
+            logits = model(current, target, conditioning)
             loss, _ = dynamics_loss(logits, target)
         batch = current[0].shape[0]
         total += float(loss) * batch
@@ -361,26 +397,71 @@ def train_dynamics(config: dict[str, Any]) -> Path:
         paths["tokenizer_checkpoint"], device
     )
     token_root = Path(paths["token_root"])
-    train_dataset = _limit_dataset(
-        TokenPairDataset(token_root, "train"), runtime.get("max_train_pairs")
-    )
+    cadence_hours = int(config.get("data", {}).get("cadence_hours", 6))
+    # Optional forcing conditioning (CO2 + solar/seasonal phase). When enabled
+    # the datasets yield a per-pair conditioning vector and the model gains a
+    # conditioning projection; when disabled this path is byte-for-byte the old
+    # unconditioned behaviour, so existing chains are unaffected.
+    conditioned = bool(model_config.get("conditioning", False))
+    conditioner = ForcingConditioner(paths["dataset_root"]) if conditioned else None
+    conditioning_dim = conditioner.dimension if conditioned else 0
+    token_collate = collate_conditioned_pairs if conditioned else collate_token_pairs
+
+    def make_token_dataset(split: str):
+        if conditioned:
+            return ConditionedTokenPairDataset(token_root, split, conditioner)
+        return TokenPairDataset(token_root, split)
+
+    # Input noising (float-style): the SAME Gaussian noise is added to the x0/x1
+    # frames of each pair and both are re-encoded with the frozen tokenizer, so
+    # the NSP learns to predict from a perturbed input frame -- the
+    # off-distribution condition it faces during rollout. Applied to TRAINING
+    # only; validation always uses clean tokens. The noise-encode runs as a
+    # batched per-epoch pre-pass into device-resident token buffers
+    # (noised_epochs.py), overlapped with the previous epoch's training, rather
+    # than inside each training step.
+    noise_std = float(optimization.get("input_noise_std", 0.0))
+    noised = noise_std > 0.0
     val_dataset = _limit_dataset(
-        TokenPairDataset(token_root, "val"), runtime.get("max_val_pairs")
+        make_token_dataset("val"), runtime.get("max_val_pairs")
     )
     loader_kwargs = _loader_kwargs(runtime, device)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(optimization["batch_size"]),
-        shuffle=True,
-        drop_last=True,
-        collate_fn=collate_token_pairs,
-        **loader_kwargs,
-    )
+    if noised:
+        train_loader = None
+        pipeline = NoisedEpochPipeline(
+            tokenizer,
+            _limit_dataset(
+                FramePairDataset(
+                    paths["dataset_root"], token_root, "train", cadence_hours, conditioner
+                ),
+                runtime.get("max_train_pairs"),
+            ),
+            noise_std=noise_std,
+            device=device,
+            precision=precision,
+            seed=int(runtime.get("seed", 0)),
+            train_batch_size=int(optimization["batch_size"]),
+            total_epochs=int(optimization["epochs"]),
+            prepass_batch_size=int(optimization.get("noise_prepass_batch_size", 64)),
+            loader_kwargs=loader_kwargs,
+        )
+    else:
+        pipeline = None
+        train_loader = DataLoader(
+            _limit_dataset(
+                make_token_dataset("train"), runtime.get("max_train_pairs")
+            ),
+            batch_size=int(optimization["batch_size"]),
+            shuffle=True,
+            drop_last=True,
+            collate_fn=token_collate,
+            **loader_kwargs,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(optimization["batch_size"]),
         shuffle=False,
-        collate_fn=collate_token_pairs,
+        collate_fn=token_collate,
         **loader_kwargs,
     )
     scale_masks = torch.from_numpy(np.load(token_root / "scale_masks.npy"))
@@ -394,8 +475,12 @@ def train_dynamics(config: dict[str, Any]) -> Path:
             model_config.get("activation_checkpointing", False)
         ),
         scale_masks=scale_masks,
+        conditioning_dim=conditioning_dim,
     ).to(device)
-    del tokenizer
+    if noised:
+        tokenizer.eval()  # frozen encoder used to re-tokenize noised frames
+    else:
+        del tokenizer
     optimizer = make_adamw(
         model.parameters(),
         optimization["lr"],
@@ -439,20 +524,30 @@ def train_dynamics(config: dict[str, Any]) -> Path:
         examples = 0
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        for step, (current, target) in enumerate(train_loader):
-            current = _move_token_pyramid(current, device)
-            target = _move_token_pyramid(target, device)
+        steps_per_epoch = pipeline.batches_per_epoch if noised else len(train_loader)
+        batches = pipeline.epoch_batches(epoch) if noised else train_loader
+        final_window = steps_per_epoch % accumulation
+        for step, batch in enumerate(batches):
+            if noised:
+                current, target, conditioning = batch
+            else:
+                current, target, conditioning = _unpack_dynamics_batch(batch, device)
+            window_size = (
+                final_window
+                if final_window and step >= steps_per_epoch - final_window
+                else accumulation
+            )
             with autocast_context(device, precision):
-                logits = train_model(current, target)
+                logits = train_model(current, target, conditioning)
                 loss, _ = dynamics_loss(logits, target)
-                scaled_loss = loss / accumulation
+                scaled_loss = loss / window_size
             scaler.scale(scaled_loss).backward()
             if (step + 1) % accumulation == 0:
                 _optimizer_step(model, optimizer, scaler, gradient_clip)
             batch = current[0].shape[0]
             total += float(loss.detach()) * batch
             examples += batch
-        if len(train_loader) % accumulation:
+        if steps_per_epoch % accumulation:
             _optimizer_step(model, optimizer, scaler, gradient_clip)
         val = _evaluate_dynamics(
             model,
@@ -487,4 +582,6 @@ def train_dynamics(config: dict[str, Any]) -> Path:
             best_val = val
             atomic_torch_save(output_dir / "best.pt", payload)
         print(json.dumps(metrics, sort_keys=True), flush=True)
+    if pipeline is not None:
+        pipeline.close()
     return output_dir / "best.pt"

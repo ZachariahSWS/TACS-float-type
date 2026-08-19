@@ -1,0 +1,71 @@
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+dataset_root = "${LUCIE_SOURCE}"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_${LUCIE_RUN}"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_${LUCIE_RUN}/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+compile_mode = "default"
+num_workers = 4
+prefetch_factor = 2
+shuffle_block = 256
+validation_batches = 16
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [3, 6], [6, 12], [12, 24], [24, 48]]
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 6
+scale_loss_weights = [0.04, 0.07, 0.11, 0.18, 0.26, 0.34]
+commitment_weight = 0.25
+
+[optimization]
+batch_size = 2
+gradient_accumulation = 4
+epochs = 100
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 32
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+# 80 GB H100 has ample headroom; the smoke sweep showed batch 16 uses ~2.5 GB
+# and runs ~7.5x faster with checkpointing off (~2.5 min/epoch vs ~18.6).
+activation_checkpointing = false
+
+[dynamics_optimization]
+# batch 16 x accum 1 = effective batch 16, identical optimization to the
+# original 4x4 but ~7.5x faster on the underused GPU.
+batch_size = 16
+gradient_accumulation = 1
+epochs = 100
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

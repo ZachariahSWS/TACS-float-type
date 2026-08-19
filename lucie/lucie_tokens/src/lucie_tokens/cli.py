@@ -4,20 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .analysis import evaluate_rollout_file, evaluate_tokenizer
-from .benchmark import benchmark_tokenizer
 from .config import load_config
-from .data import (
-    build_training_cache,
-    convert_hourly,
-    inspect_source,
-    validate_dataset,
-)
-from .runtime import atomic_json
-from .imports import import_lucie2d_preprocessed, import_lucie3d_test
-from .tokens import tokenize_dataset
-from .training import train_dynamics, train_tokenizer
-from .workflows import rollout
 
 
 def _split_values(value: str) -> tuple[str, ...]:
@@ -33,47 +20,6 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--splits", default="train,val,test")
     inspect.add_argument("--samples", type=int, default=16)
     inspect.add_argument("--output")
-
-    convert = commands.add_parser("convert")
-    convert.add_argument("source")
-    convert.add_argument("output")
-    convert.add_argument("--splits", default="train,val,test")
-    convert.add_argument("--compression", choices=("lzf", "gzip"))
-    convert.add_argument("--overwrite", action="store_true")
-    convert.add_argument(
-        "--years",
-        help="Comma-separated source filename years, for example 1981,2010",
-    )
-    convert.add_argument(
-        "--max-files-per-year",
-        type=int,
-        help="Keep only the first N hourly files from each selected year",
-    )
-
-    cache = commands.add_parser("build-cache")
-    cache.add_argument("dataset")
-    cache.add_argument("--splits", default="train,val,test")
-    cache.add_argument("--overwrite", action="store_true")
-    cache.add_argument("--cadence-hours", type=int, default=6)
-
-    validate = commands.add_parser("validate-data")
-    validate.add_argument("dataset")
-    validate.add_argument("--cadence-hours", type=int, default=6)
-
-    import_3d = commands.add_parser("import-lucie3d-test")
-    import_3d.add_argument("source")
-    import_3d.add_argument("output")
-    import_3d.add_argument("--train-years", default="2011")
-    import_3d.add_argument("--val-years", default="2012")
-    import_3d.add_argument("--test-years", default="2013")
-    import_3d.add_argument("--overwrite", action="store_true")
-
-    import_2d = commands.add_parser("import-lucie2d")
-    import_2d.add_argument("source")
-    import_2d.add_argument("output")
-    import_2d.add_argument("--train-stop", type=int, default=16000)
-    import_2d.add_argument("--val-stop", type=int, default=16100)
-    import_2d.add_argument("--overwrite", action="store_true")
 
     train_tok = commands.add_parser("train-tokenizer")
     train_tok.add_argument("config")
@@ -108,66 +54,41 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("config")
     benchmark.add_argument("--iterations", type=int, default=5)
     benchmark.add_argument("--output")
+
+    diagnostics = commands.add_parser("climate-diagnostics")
+    diagnostics.add_argument("config")
+    diagnostics.add_argument("--split", default="val")
+    diagnostics.add_argument("--steps", type=int, default=2000)
+    diagnostics.add_argument("--start", type=int, default=0)
+    diagnostics.add_argument("--temperature", type=float, default=1.0)
+    diagnostics.add_argument("--top-k", type=int)
+    diagnostics.add_argument("--max-reference-frames", type=int)
+    diagnostics.add_argument("--checkpoint", help="override paths.dynamics_checkpoint")
+    diagnostics.add_argument(
+        "--data-spectrum", help="npz of precomputed truth spectrum (skips source read)"
+    )
+    diagnostics.add_argument("--output")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "inspect-source":
+        from .data import inspect_source
+        from .runtime import atomic_json
+
         result = inspect_source(
             args.source, _split_values(args.splits), args.samples
         )
         if args.output:
             atomic_json(args.output, result)
-    elif args.command == "convert":
-        result = convert_hourly(
-            source_root=args.source,
-            output_root=args.output,
-            splits=_split_values(args.splits),
-            compression=args.compression,
-            overwrite=args.overwrite,
-            years=(
-                tuple(int(value) for value in _split_values(args.years))
-                if args.years
-                else None
-            ),
-            max_files_per_year=args.max_files_per_year,
-        )
-    elif args.command == "build-cache":
-        result = build_training_cache(
-            args.dataset,
-            _split_values(args.splits),
-            args.overwrite,
-            args.cadence_hours,
-        )
-    elif args.command == "validate-data":
-        result = validate_dataset(args.dataset, args.cadence_hours)
-    elif args.command == "import-lucie3d-test":
-        result = import_lucie3d_test(
-            args.source,
-            args.output,
-            train_years=tuple(
-                int(value) for value in _split_values(args.train_years)
-            ),
-            val_years=tuple(
-                int(value) for value in _split_values(args.val_years)
-            ),
-            test_years=tuple(
-                int(value) for value in _split_values(args.test_years)
-            ),
-            overwrite=args.overwrite,
-        )
-    elif args.command == "import-lucie2d":
-        result = import_lucie2d_preprocessed(
-            args.source,
-            args.output,
-            train_stop=args.train_stop,
-            val_stop=args.val_stop,
-            overwrite=args.overwrite,
-        )
     elif args.command == "train-tokenizer":
+        from .training import train_tokenizer
+
         result = {"checkpoint": str(train_tokenizer(load_config(args.config)))}
     elif args.command == "tokenize":
+        from .tokens import tokenize_dataset
+
         config = load_config(args.config)
         result = tokenize_dataset(
             config["paths"]["dataset_root"],
@@ -182,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
             cadence_hours=int(config.get("data", {}).get("cadence_hours", 6)),
         )
     elif args.command == "evaluate-tokenizer":
+        from .analysis import evaluate_tokenizer
+
         config = load_config(args.config)
         output = args.output or str(
             Path(config["paths"]["tokenizer_run"]) / "evaluation.json"
@@ -200,8 +123,12 @@ def main(argv: list[str] | None = None) -> None:
             cadence_hours=int(config.get("data", {}).get("cadence_hours", 6)),
         )
     elif args.command == "train-dynamics":
+        from .training import train_dynamics
+
         result = {"checkpoint": str(train_dynamics(load_config(args.config)))}
     elif args.command == "rollout":
+        from .workflows import rollout
+
         result = {
             "output": str(
                 rollout(
@@ -216,13 +143,45 @@ def main(argv: list[str] | None = None) -> None:
             )
         }
     elif args.command == "evaluate-rollout":
+        from .analysis import evaluate_rollout_file
+
         result = evaluate_rollout_file(args.rollout, args.output)
     elif args.command == "benchmark":
+        from .benchmark import benchmark_tokenizer
+        from .runtime import atomic_json
+
         result = benchmark_tokenizer(
             load_config(args.config), args.iterations
         )
         if args.output:
             atomic_json(args.output, result)
+    elif args.command == "climate-diagnostics":
+        from .diagnostics import climate_diagnostics
+
+        config = load_config(args.config)
+        token_file = str(
+            Path(config["paths"]["token_root"]) / args.split / "source.h5"
+        )
+        output = args.output or str(
+            Path(config["paths"]["dynamics_run"]) / f"diagnostics_{args.split}"
+        )
+        result = climate_diagnostics(
+            args.checkpoint or config["paths"]["dynamics_checkpoint"],
+            token_file,
+            config["paths"]["dataset_root"],
+            output,
+            split=args.split,
+            start_index=args.start,
+            steps=args.steps,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            max_reference_frames=args.max_reference_frames,
+            cadence_hours=int(config.get("data", {}).get("cadence_hours", 6)),
+            precision=config.get("runtime", {}).get("precision", "auto"),
+            device_name=config.get("runtime", {}).get("device", "auto"),
+            data_spectrum_path=args.data_spectrum,
+            tokenizer_checkpoint=config["paths"]["tokenizer_checkpoint"],
+        )
     else:
         raise AssertionError(args.command)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))

@@ -26,20 +26,28 @@ class Encoder(nn.Module):
         code_dim: int,
         activation_checkpointing: bool,
         latent_shape: tuple[int, int],
+        grid_shape: tuple[int, int],
     ) -> None:
         super().__init__()
         half = max(width // 2, 32)
+        self.latent_shape = tuple(int(v) for v in latent_shape)
+        # Downsample toward the latent with as many stride-2 conv stages as fit
+        # without undershooting, then adaptive-pool to the exact latent so that
+        # non-power-of-2 latents (e.g. 16x32 from 48x96) are supported.
+        ratio = max(1, grid_shape[0] // self.latent_shape[0])
+        n_down = max(0, ratio.bit_length() - 1)
+        strides = [2 if i < n_down else 1 for i in range(2)]
         self.stem = nn.Sequential(
             SphericalConv2d(
-                in_channels, half, kernel_size=3, stride=2, padding=1
+                in_channels, half, kernel_size=3, stride=strides[0], padding=1
             ),
             nn.SiLU(),
             nn.GroupNorm(1, half),
-            SphericalConv2d(half, width, kernel_size=3, stride=2, padding=1),
+            SphericalConv2d(half, width, kernel_size=3, stride=strides[1], padding=1),
             nn.SiLU(),
             nn.GroupNorm(1, width),
         )
-        self.coordinates = CoordinateEmbedding(width, latent_shape)
+        self.coordinates = CoordinateEmbedding(width, self.latent_shape)
         self.transformer = TransformerStack(
             width,
             depth,
@@ -49,7 +57,10 @@ class Encoder(nn.Module):
         self.to_code = nn.Linear(width, code_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.coordinates(self.stem(x))
+        x = self.stem(x)
+        if tuple(x.shape[-2:]) != self.latent_shape:
+            x = F.adaptive_avg_pool2d(x, self.latent_shape)
+        x = self.coordinates(x)
         batch, channels, height, width = x.shape
         tokens = x.flatten(2).transpose(1, 2)
         tokens = self.transformer(tokens)
@@ -70,9 +81,11 @@ class Decoder(nn.Module):
         code_dim: int,
         activation_checkpointing: bool,
         latent_shape: tuple[int, int],
+        grid_shape: tuple[int, int],
     ) -> None:
         super().__init__()
         half = max(width // 2, 32)
+        self.grid_shape = tuple(int(v) for v in grid_shape)
         self.from_code = nn.Linear(code_dim, width, bias=False)
         self.coordinates = CoordinateEmbedding(width, latent_shape)
         self.transformer = TransformerStack(
@@ -92,9 +105,13 @@ class Decoder(nn.Module):
         x = self.coordinates(x)
         tokens = self.transformer(x.flatten(2).transpose(1, 2))
         x = tokens.transpose(1, 2).reshape(batch, -1, height, width)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        # Upsample to the full grid without ever downsampling: pass through a
+        # half-resolution stage when the latent is coarser than it, then refine.
+        mid = (self.grid_shape[0] // 2, self.grid_shape[1] // 2)
+        if x.shape[-2] < mid[0]:
+            x = F.interpolate(x, size=mid, mode="bilinear", align_corners=False)
         x = F.silu(self.up1(x))
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = F.interpolate(x, size=self.grid_shape, mode="bilinear", align_corners=False)
         return self.up2(x)
 
 
@@ -107,6 +124,7 @@ class ResidualMultiScaleVQ(nn.Module):
         ema_decay: float = 0.99,
         ema_epsilon: float = 1e-5,
         dead_code_threshold: float = 0.5,
+        norm_guard_factor: float = 8.0,
         distance_chunk: int = 8192,
     ) -> None:
         super().__init__()
@@ -116,6 +134,7 @@ class ResidualMultiScaleVQ(nn.Module):
         self.ema_decay = float(ema_decay)
         self.ema_epsilon = float(ema_epsilon)
         self.dead_code_threshold = float(dead_code_threshold)
+        self.norm_guard_factor = float(norm_guard_factor)
         self.distance_chunk = int(distance_chunk)
         initial = F.normalize(
             torch.randn(codebook_size, code_dim, dtype=torch.float32), dim=1
@@ -170,6 +189,20 @@ class ResidualMultiScaleVQ(nn.Module):
             dim=0,
         )
         flat_indices = torch.cat(indices)
+        # The EMA update sits outside the gradient-clipped path, so a runaway
+        # residual cascade can inflate the codebook without limit (codes track
+        # the running mean of assigned values). Bound the update inputs to a
+        # multiple of the median code/value norm; the bound ratchets up as the
+        # codebook grows, so healthy training is unaffected. Anchoring to the
+        # smaller of the two medians keeps the bound sane when either side is
+        # already poisoned (a spiking batch, or a damaged checkpoint).
+        value_norms = flat_values.norm(dim=1, keepdim=True)
+        norm_limit = self.norm_guard_factor * torch.minimum(
+            self.codebook.norm(dim=1).median(), value_norms.median()
+        ).clamp_min(self.ema_epsilon)
+        flat_values = flat_values * (
+            norm_limit / value_norms.clamp_min(self.ema_epsilon)
+        ).clamp(max=1.0)
         count = torch.bincount(
             flat_indices, minlength=self.codebook_size
         ).to(self.ema_count.dtype)
@@ -188,7 +221,13 @@ class ResidualMultiScaleVQ(nn.Module):
             * total
         )
         self.codebook.copy_(self.ema_sum / smoothed.unsqueeze(1))
-        dead = self.ema_count < self.dead_code_threshold
+        # Reseed unused codes, and also codes whose norm escaped the input
+        # bound (e.g. inherited from a damaged checkpoint). Oversized codes
+        # can never win a nearest-neighbour assignment for normal latents, so
+        # without this they linger just above the dead-count threshold forever.
+        dead = (self.ema_count < self.dead_code_threshold) | (
+            self.codebook.norm(dim=1) > norm_limit
+        )
         if bool(dead.any()):
             count_dead = int(dead.sum())
             choices = torch.randint(
@@ -297,15 +336,10 @@ class ClimateTokenizer(nn.Module):
         self.scales = tuple(tuple(value) for value in scales)
         self.state_channels = int(state_channels)
         self.grid_shape = tuple(int(value) for value in grid_shape)
-        latent_shape = (
-            self.grid_shape[0] // 4,
-            self.grid_shape[1] // 4,
-        )
-        if latent_shape != self.scales[-1]:
-            raise ValueError(
-                f"Grid {self.grid_shape} and finest scale {self.scales[-1]} "
-                "must match the two-stage 4x stem"
-            )
+        # The latent resolution is the finest scale; the encoder downsamples to
+        # it and the decoder upsamples back to grid_shape, so any finest scale
+        # that divides (or adaptive-pools from) the grid is supported.
+        latent_shape = tuple(self.scales[-1])
         self.encoder = Encoder(
             self.state_channels,
             width,
@@ -314,6 +348,7 @@ class ClimateTokenizer(nn.Module):
             code_dim,
             activation_checkpointing,
             latent_shape,
+            self.grid_shape,
         )
         self.quantizer = ResidualMultiScaleVQ(
             code_dim, codebook_size, self.scales
@@ -326,6 +361,7 @@ class ClimateTokenizer(nn.Module):
             code_dim,
             activation_checkpointing,
             latent_shape,
+            self.grid_shape,
         )
 
     def encode(self, state: torch.Tensor, update_ema: bool = False) -> TokenPyramid:

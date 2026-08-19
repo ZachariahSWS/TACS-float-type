@@ -28,112 +28,86 @@ The exact reference package versions are in `requirements.lock`. A cluster may
 substitute its supported PyTorch/CUDA build; run manifests record the actual
 environment.
 
-## Local-first workflow
+## Bridges-2
 
-### Downloaded Zenodo pilots
+Bridges-2 provides the CUDA and PyTorch environment; do not transfer the local
+virtual environment or install `requirements.lock` there. The verified base is:
 
-Two direct importers support the data currently under `../data`.
+- `/ocean/containers/ngc/pytorch/pytorch_24.11-py3.sif`
+- Python 3.12
+- NVIDIA PyTorch 2.6 with CUDA 12.6
+- an H100 requested as `--gres=gpu:h100-80:1`
 
-The LUCIE-3D archive from Zenodo 17032361 contains exactly the 33 recurrent
-fields, but only for official test years. Despite `6hr` in the archive name,
-its filenames are spaced by four hours. The importer computes pilot
-normalization from 2011 and deliberately maps 2011/2012/2013 to local
-train/validation/test:
+That container lacks h5py. Install only its wheel into home once:
 
 ```bash
-lucie-tokens import-lucie3d-test \
-  ../data/zenodo_17032361/test_h5 \
-  ../data/pipeline_lucie3d_test
-lucie-tokens validate-data ../data/pipeline_lucie3d_test --cadence-hours 4
-lucie-tokens train-tokenizer configs/local_lucie3d_test.toml
+export LUCIE_IMAGE=/ocean/containers/ngc/pytorch/pytorch_24.11-py3.sif
+export LUCIE_DEPS="$HOME/lucie_deps_py312"
+mkdir -p "$LUCIE_DEPS"
+apptainer exec "$LUCIE_IMAGE" \
+  python -m pip install --no-deps --target "$LUCIE_DEPS" h5py==3.16.0
 ```
 
-This is the closest local architecture pilot, but its metrics cannot be
-reported as official test performance because test data supplies its training
-normalization and split.
-
-The importer combines the multipart tar members into one HDF5 file per split
-year. `state_norm` is normalized float16 with chunks of
-`(1, 33, 48, 96)`; timestamps, original source indices, and valid transition
-pairs are stored beside it. This layout avoids opening thousands of small
-source files during training while preserving efficient frame-level shuffled
-reads.
-
-The original 2D LUCIE NPZ from Zenodo 15164648 has five recurrent fields rather
-than 33 vertical-state fields. Its importer follows the official training
-script's `0:16000` train and `16000:16100` validation split:
+Choose a writable Ocean directory for tokens, checkpoints, and metrics. The
+hourly atmospheric source is read directly and is never copied. The
+configuration refuses to run if either variable is unset:
 
 ```bash
-lucie-tokens import-lucie2d \
-  ../data/zenodo_15164648/preprocessed \
-  ../data/pipeline_lucie2d
-lucie-tokens validate-data ../data/pipeline_lucie2d --cadence-hours 6
-lucie-tokens train-tokenizer configs/local_lucie2d.toml
+export LUCIE_SOURCE=/ocean/projects/mth260004p/pdubey1/lucie_3d/1_step_1hr_h5df_test_with_newvars
+export LUCIE_WORK=/ocean/projects/mth260004p/$USER/lucie_work
+test -r "$LUCIE_SOURCE/normalize_mean.npz"
+mkdir -p "$LUCIE_WORK"
 ```
 
-The 2D pilot is cheaper and useful for performance iteration, but it is a
-different scientific state definition. Its TISR and orography input channels
-are preserved in the source data but excluded from recurrent tokens.
-
-### Production source layout
-
-Start by inspecting the downloaded `_with_newvars` directory. This is cheap and
-will expose missing normalization files or schema differences before a long
-conversion:
+The wrapper supplies the source tree and h5py layer to the container. Run it
+from an allocated compute node:
 
 ```bash
-lucie-tokens inspect-source /path/to/1_step_1hr_h5df_test_with_newvars \
+scripts/bridges_exec.sh --help
+```
+
+Preflight the production source:
+
+```bash
+scripts/bridges_exec.sh inspect-source "$LUCIE_SOURCE" \
   --samples 32 --output source_report.json
 ```
 
-Convert physical hourly data, then build the normalized six-hour cache:
+Submit eager-mode tokenizer training from a login node. A plain submission
+trains seed 0; a job array trains one seed per task, each with its own
+output directories:
 
 ```bash
-lucie-tokens convert /path/to/1_step_1hr_h5df_test_with_newvars data/lucie
-lucie-tokens build-cache data/lucie --cadence-hours 6
-lucie-tokens validate-data data/lucie
+sbatch scripts/bridges_train_tokenizer.sbatch            # single run, seed 0
+sbatch --array=0-3 scripts/bridges_train_tokenizer.sbatch  # four-seed set
 ```
 
-For the first local pass, convert only January-sized slices from the train and
-validation years:
+The batch script derives `LUCIE_SEED` from the array task index and sets
+`LUCIE_RUN=h100_seed${LUCIE_SEED}`. Run directories are
+`$LUCIE_WORK/runs/tokenizer_${LUCIE_RUN}`, so runs never collide and
+resubmitting the same seed resumes from its `latest.pt`. When invoking
+`bridges_exec.sh` manually (outside the batch script), export `LUCIE_RUN`
+and `LUCIE_SEED` first; the configuration refuses to load without them.
 
-```bash
-lucie-tokens convert /path/to/1_step_1hr_h5df_test_with_newvars data/lucie-small \
-  --splits train,val --years 1981,2010 --max-files-per-year 744
-lucie-tokens build-cache data/lucie-small --splits train,val --cadence-hours 6
-```
+`configs/bridges_h100.toml` selects every sixth hourly file, reads and
+normalizes its 33 recurrent fields on demand, and uses no atmospheric data
+cache. Token export writes only compact indices (about 38 MB for the full
+dataset). The configuration also uses automatic BF16 selection, restart
+checkpoints, and `compile = false`. Benchmark eager mode before enabling
+compilation or increasing batch sizes.
 
-The year filter is applied to each split, so years absent from a split are
-ignored as long as that split has at least one selected year.
+## Data flow
 
-Edit paths in `configs/local_5070.toml`, then train and evaluate the tokenizer:
+The atmospheric reader accepts only the production source contract:
+`train/`, `val/`, and `test/` directories containing exact
+`YYYY_HHHH.h5` filenames, plus `normalize_mean.npz`, `normalize_std.npz`,
+`lat.npy`, and `lon.npy`. It selects the configured cadence and normalizes each
+frame while reading it. Files such as `*_backup.h5` are ignored.
 
-```bash
-lucie-tokens benchmark configs/local_5070.toml --output benchmark.json
-lucie-tokens train-tokenizer configs/local_5070.toml
-lucie-tokens evaluate-tokenizer configs/local_5070.toml
-```
-
-Apply the benchmark's recommended `decode_scale_batch_size`, then export
-compact token indices and train the unconditional dynamics model:
-
-```bash
-lucie-tokens tokenize configs/local_5070.toml
-lucie-tokens train-dynamics configs/local_5070.toml
-```
-
-Generate a deterministic 7-day rollout from one token shard:
-
-```bash
-lucie-tokens rollout \
-  runs/dynamics_5070/best.pt \
-  data/tokens_5070/test/2011.h5 \
-  runs/dynamics_5070/rollout_7d.h5 \
-  --steps 28
-lucie-tokens evaluate-rollout \
-  runs/dynamics_5070/rollout_7d.h5 \
-  runs/dynamics_5070/rollout_7d.json
-```
+Tokenizer export creates compact `uint16` token HDF5 files under
+`$LUCIE_WORK/tokens/${LUCIE_RUN}`. Those files contain token indices, timestamps, and valid
+adjacent transitions and are the input to dynamics training. No atmospheric
+frames are copied.
 
 ## Performance guidance
 
@@ -156,8 +130,8 @@ lucie-tokens evaluate-rollout \
 - The dynamics model uses PyTorch fused scaled-dot-product attention and
   activation checkpointing. Token vectors are looked up per batch; they are
   never expanded for the entire dataset.
-- The raw data remains float32, while the six-hour training cache is normalized
-  float16 to reduce local disk traffic and storage.
+- Source fields remain float32 on disk and are converted to normalized float16
+  tensors as they are read.
 - Frames/second and peak allocated VRAM are written to metrics; detailed CPU,
   data-loading, and CUDA activity is available in the opt-in profiler trace.
 - A custom Triton or CUDA kernel is not currently justified. Exact VQ search

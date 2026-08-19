@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import h5py
@@ -8,7 +7,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .data import ClimateFrameDataset
+from .data import (
+    SourceClimateFrameDataset,
+    load_frame_dataset_manifest,
+    load_frame_grid,
+)
 from .runtime import atomic_json, autocast_context, resolve_device, resolve_precision
 from .tokens import load_tokenizer_checkpoint
 
@@ -53,9 +56,9 @@ def evaluate_tokenizer(
     device = resolve_device(device_name)
     precision = resolve_precision(precision, device)
     model, checkpoint = load_tokenizer_checkpoint(checkpoint_path, device)
-    manifest = json.loads((Path(dataset_root) / "manifest.json").read_text())
+    manifest = load_frame_dataset_manifest(dataset_root)
     channel_names = tuple(manifest["state_channels"])
-    dataset = ClimateFrameDataset(dataset_root, split, cadence_hours)
+    dataset = SourceClimateFrameDataset(dataset_root, split, cadence_hours)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -63,16 +66,10 @@ def evaluate_tokenizer(
         num_workers=0,
         pin_memory=device.type == "cuda",
     )
-    with h5py.File(Path(dataset_root) / "grid.h5", "r") as grid:
-        mean = torch.from_numpy(np.asarray(grid["state_mean"], dtype=np.float32)).to(
-            device
-        )
-        std = torch.from_numpy(np.asarray(grid["state_std"], dtype=np.float32)).to(
-            device
-        )
-        latitude_weight = torch.from_numpy(
-            np.asarray(grid["quadrature_weight"], dtype=np.float32)
-        ).to(device)
+    mean_values, std_values, latitude_values = load_frame_grid(dataset_root)
+    mean = torch.from_numpy(mean_values).to(device)
+    std = torch.from_numpy(std_values).to(device)
+    latitude_weight = torch.from_numpy(latitude_values).to(device)
     normalized_sse = torch.zeros(len(channel_names), device=device)
     physical_sse = torch.zeros(len(channel_names), device=device)
     denominator = torch.zeros((), device=device)

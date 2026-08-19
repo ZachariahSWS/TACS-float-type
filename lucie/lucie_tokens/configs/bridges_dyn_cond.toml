@@ -1,25 +1,27 @@
 config_version = 1
 
 [data]
-cadence_hours = 4
+cadence_hours = 6
 
 [paths]
-dataset_root = "../data/pipeline_lucie3d_test"
-tokenizer_run = "runs/lucie3d_test_tokenizer"
-tokenizer_checkpoint = "runs/lucie3d_test_tokenizer/best.pt"
-token_root = "../data/tokens_lucie3d_test"
-dynamics_run = "runs/lucie3d_test_dynamics"
-dynamics_checkpoint = "runs/lucie3d_test_dynamics/best.pt"
+dataset_root = "${LUCIE_SOURCE}"
+# Reuse seed0's tokenizer + tokens; isolate the dynamics output. Same 384/8
+# architecture as chain-1 so the only variable vs it is forcing conditioning.
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_${LUCIE_RUN}_cond"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_${LUCIE_RUN}_cond/best.pt"
 
 [runtime]
-device = "auto"
+device = "cuda"
 precision = "auto"
-seed = 0
+seed = "${LUCIE_SEED}"
 resume = true
 performance_mode = true
-compile = true
+compile = false
 compile_mode = "default"
-num_workers = 2
+num_workers = 4
 prefetch_factor = 2
 shuffle_block = 256
 validation_batches = 16
@@ -51,11 +53,13 @@ batch_size = 32
 width = 384
 depth = 8
 heads = 8
-activation_checkpointing = true
+activation_checkpointing = false
+# Tier-A forcing conditioning: CO2 + solar/seasonal phase (see conditioning.py).
+conditioning = true
 
 [dynamics_optimization]
-batch_size = 4
-gradient_accumulation = 4
+batch_size = 16
+gradient_accumulation = 1
 epochs = 100
 lr = 2e-4
 weight_decay = 0.01

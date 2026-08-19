@@ -5,7 +5,7 @@ __pycache__/
 # Virtualenv / local tool caches
 .venv/
 .uv-cache/
-flake.nix
+# flake.lock churns with the machine-local devshells path input; flake.nix IS tracked
 flake.lock
 
 # OS/editor noise
@@ -40,3 +40,6 @@ py2d_output/
 
 # Downloaded and derived LUCIE datasets
 /lucie/data/
+
+# Local 5070 inference artifacts (checkpoints, tokens, figures, videos, logs)
+/lucie/local/

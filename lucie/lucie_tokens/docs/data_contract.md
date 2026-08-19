@@ -17,30 +17,16 @@ temperature. It preserves `tp6hr` and `surface_temperature` as diagnostics.
 The first five hours of `tp6hr` in each source year are invalid because the
 rolling six-hour window does not cross source-file year boundaries.
 
-SST and the inherited one-hour-accumulation TISR are retained as dynamic
-fields. Orography and land/sea mask are stored once. The separate six-hour CO2
-array is also stored once with generated timestamps beginning at 1981-01-01.
-None of these fields condition the initial dynamics model.
+The reader accepts additional source keys but selects only the recurrent state
+channels above. Missing recurrent fields, invalid normalization, or a grid
+other than `48×96` is fatal. Exact `YYYY_HHHH.h5` names are accepted; backup
+files and other HDF5 names are ignored.
 
-The converter accepts additional source keys but never infers schema from HDF5
-file size. Missing or non-finite recurrent state is fatal.
+The hourly source shards are the physical-value authority. Training selects
+the configured cadence and converts each frame to normalized float16 in memory.
+There is no converted atmospheric dataset or training cache.
 
-The raw hourly shards are the physical-value authority. The six-hour cache is a
-lossy normalized float16 acceleration layer and can always be regenerated.
-
-## Local Zenodo variants
-
-The model records channel count, channel names, grid shape, and cadence in
-manifests and checkpoints. This permits two local-only variants:
-
-- Zenodo 17032361 supplies the same 33 fields but only official 2011–2013 test
-  data. The archive actually has four-hour filename spacing. Its importer
-  computes normalization from the locally assigned 2011 training split.
-- Zenodo 15164648 supplies five 2D recurrent fields (`temperature`, `humidity`,
-  `u_wind`, `v_wind`, and `surface_pressure`) at six-hour cadence. Published
-  normalization and the official `16000/100/remainder` index split are retained.
-
-Both variants remain on `48×96`, so the `12×24` finest latent and 388-token
-pyramid are unchanged. Neither pilot should be confused with production
-training on the 1981–2009 33-channel dataset.
-
+Tokenizer export writes compact `uint16` indices, timestamps, source
+year/hour, and valid adjacent transitions. Those derived token files are the
+only dataset materialized by the pipeline and are the input contract for
+dynamics training.

@@ -3,11 +3,10 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import h5py
 import numpy as np
 import torch
 
-from .data import ClimateFrameDataset
+from .data import SourceClimateFrameDataset, load_frame_grid
 from .runtime import (
     autocast_context,
     configure_torch,
@@ -28,16 +27,15 @@ def benchmark_tokenizer(config: dict, iterations: int = 5) -> dict:
     precision = resolve_precision(runtime.get("precision", "auto"), device)
     configure_torch(True)
     dataset_root = Path(config["paths"]["dataset_root"])
-    cadence_hours = int(config.get("data", {}).get("cadence_hours", 6))
-    dataset = ClimateFrameDataset(dataset_root, "train", cadence_hours)
+    data_config = dict(config.get("data", {}))
+    cadence_hours = int(data_config.get("cadence_hours", 6))
+    dataset = SourceClimateFrameDataset(dataset_root, "train", cadence_hours)
     batch_size = int(optimization["batch_size"])
     state = torch.stack([dataset[index][0] for index in range(batch_size)]).to(
         device, non_blocking=True
     )
-    with h5py.File(dataset_root / "grid.h5", "r") as grid:
-        weights = torch.from_numpy(
-            np.asarray(grid["quadrature_weight"], dtype=np.float32)
-        ).to(device)
+    _, _, latitude_values = load_frame_grid(dataset_root)
+    weights = torch.from_numpy(latitude_values).to(device)
     decoder_checkpointing = bool(
         model_config.get("decoder_activation_checkpointing", False)
     )

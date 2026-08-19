@@ -20,6 +20,7 @@ class NextScaleDynamics(nn.Module):
         heads: int = 8,
         activation_checkpointing: bool = False,
         scale_masks: torch.Tensor | None = None,
+        conditioning_dim: int = 0,
     ) -> None:
         super().__init__()
         self.scales = tuple(tuple(value) for value in scales)
@@ -37,6 +38,15 @@ class NextScaleDynamics(nn.Module):
         self.scale_embedding = nn.Embedding(len(scales), width)
         self.frame_embedding = nn.Embedding(2, width)
         self.coordinate_projection = nn.Linear(3, width, bias=False)
+        # Optional forcing conditioning (e.g. CO2 + solar/seasonal phase): a
+        # global FiLM-style bias added to every token. dim 0 -> unconditioned,
+        # so existing checkpoints/configs are unaffected.
+        self.conditioning_dim = int(conditioning_dim)
+        self.conditioning_projection = (
+            nn.Linear(conditioning_dim, width, bias=False)
+            if conditioning_dim > 0
+            else None
+        )
         self.transformer = TransformerStack(
             width,
             depth,
@@ -54,7 +64,16 @@ class NextScaleDynamics(nn.Module):
             "depth": self.depth,
             "heads": self.heads,
             "codebook_size": self.codebook_size,
+            "conditioning_dim": self.conditioning_dim,
         }
+
+    def _apply_conditioning(
+        self, sequence: torch.Tensor, conditioning: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.conditioning_projection is None or conditioning is None:
+            return sequence
+        bias = self.conditioning_projection(conditioning.to(sequence.dtype))
+        return sequence + bias.unsqueeze(1)
 
     def _coordinates(
         self, shape: tuple[int, int], device: torch.device
@@ -166,8 +185,10 @@ class NextScaleDynamics(nn.Module):
         self,
         current: tuple[torch.Tensor, ...],
         target: tuple[torch.Tensor, ...],
+        conditioning: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         sequence, segments = self._sequence(current, target[:-1])
+        sequence = self._apply_conditioning(sequence, conditioning)
         mask = self._attention_mask(segments, sequence.device)
         hidden = self.transformer(sequence, mask)
         outputs = []
@@ -182,10 +203,13 @@ class NextScaleDynamics(nn.Module):
             expanded = self._resize_hidden(source, source_shape, target_shape)
             expanded = self._add_target_coordinates(expanded, target_shape)
             logits = self.heads_by_scale[scale_index](expanded)
-            logits = logits.masked_fill(
-                ~self.scale_masks[scale_index].view(1, 1, -1),
-                torch.finfo(logits.dtype).min,
-            )
+            # Do NOT apply scale_masks on this path: forward() feeds the
+            # training/val loss, and val/test contain target codes absent from
+            # train (masks are built from the train split only). Masking those
+            # targets to finfo.min makes their cross-entropy explode to ~1e32,
+            # producing a constant, model-independent, broken val_loss. Masking
+            # belongs only in generation (predict_next_scale), which still masks
+            # so rollouts never sample a code unseen in training.
             outputs.append(logits)
         return tuple(outputs)
 
@@ -193,11 +217,13 @@ class NextScaleDynamics(nn.Module):
         self,
         current: tuple[torch.Tensor, ...],
         target_known: tuple[torch.Tensor, ...],
+        conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale_index = len(target_known)
         if scale_index >= len(self.scales):
             raise ValueError("All target scales have already been generated")
         sequence, segments = self._sequence(current, target_known)
+        sequence = self._apply_conditioning(sequence, conditioning)
         mask = self._attention_mask(segments, sequence.device)
         hidden = self.transformer(sequence, mask)
         if scale_index == 0:

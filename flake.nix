@@ -9,6 +9,7 @@
 
       project = dev.lib.${system}.mkProject {
         name = "tacs";
+        extraPackages = pkgs: [ pkgs.ffmpeg ];
         extraShellHook = ''
           if [ -x "$NIX_DEV_ROOT/.cuda-shim/ptxas" ]; then
             export TRITON_PTXAS_PATH="$NIX_DEV_ROOT/.cuda-shim/ptxas"
