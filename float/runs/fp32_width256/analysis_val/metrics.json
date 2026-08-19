@@ -1,0 +1,42 @@
+{
+  "data_path": "py2d_output/output.h5",
+  "device": "cuda",
+  "field": "omega",
+  "horizons": [
+    1,
+    5,
+    20
+  ],
+  "num_rollout_starts": 480,
+  "rollout": {
+    "1": {
+      "enstrophy_spectrum_relative_l2": 0.0008877207533519365,
+      "mse": 0.21108627239526764,
+      "mse_vs_persistence_ratio": 0.0380932093867687,
+      "persistence_mse": 5.541309745053573,
+      "relative_l2": 0.04389267843839713,
+      "tke_spectrum_relative_l2": 0.0008249584402061253
+    },
+    "20": {
+      "enstrophy_spectrum_relative_l2": 0.03995954887043742,
+      "mse": 13.572088773361536,
+      "mse_vs_persistence_ratio": 0.09188574309841428,
+      "persistence_mse": 147.7061436922281,
+      "relative_l2": 0.3525496345899046,
+      "tke_spectrum_relative_l2": 0.02149191454410798
+    },
+    "5": {
+      "enstrophy_spectrum_relative_l2": 0.0067546568686190946,
+      "mse": 2.4572769267281367,
+      "mse_vs_persistence_ratio": 0.06778405603715366,
+      "persistence_mse": 36.251547493429115,
+      "relative_l2": 0.14980979399677208,
+      "tke_spectrum_relative_l2": 0.004641009528590764
+    }
+  },
+  "sample_start": 8500,
+  "sample_stop": 9000,
+  "stage_paths": [
+    "runs2/fp32_4/stage1/best.pt"
+  ]
+}
