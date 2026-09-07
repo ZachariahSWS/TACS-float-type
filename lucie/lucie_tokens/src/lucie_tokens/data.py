@@ -24,6 +24,7 @@ from .schema import (
 
 
 FILENAME_RE = re.compile(r"^(?P<year>\d{4})_(?P<hour>\d+)\.h5$")
+PACKED_FILENAME_RE = re.compile(r"^packed_(?P<year>\d{4})\.h5$")
 SPLITS = ("train", "val", "test")
 
 
@@ -50,6 +51,96 @@ def source_files(source_root: str | Path, split: str) -> list[Path]:
     if not files:
         raise FileNotFoundError(f"No source HDF5 files under {directory}")
     return files
+
+
+def packed_files(source_root: str | Path, split: str) -> list[Path]:
+    """Year-sharded consolidated files written by scripts/pack_source.py.
+
+    One packed_YYYY.h5 per year holds every frame of that year in timestamp
+    order, so concatenating the (year-sorted) shards reproduces exactly the
+    frame order of the per-file layout — token transitions stay valid."""
+    if split not in SPLITS:
+        raise ValueError(f"Unknown split {split!r}")
+    directory = Path(source_root, split)
+    return sorted(
+        (
+            path
+            for path in directory.glob("packed_*.h5")
+            if PACKED_FILENAME_RE.fullmatch(path.name)
+        ),
+        key=lambda path: int(PACKED_FILENAME_RE.fullmatch(path.name)["year"]),
+    )
+
+
+def warm_page_cache(
+    paths: Sequence[str | Path],
+    budget_bytes: int,
+    threads: int = 4,
+    block_bytes: int = 32 << 20,
+) -> int:
+    """Stream files through the page cache with large sequential reads.
+
+    Per-frame reads on a freshly allocated node are latency-bound (one Lustre
+    round trip per ~300 KB row), which is what makes a cold prepass ~25x
+    slower than a warm one. Pulling the shards in first with big sequential
+    reads turns those into memory copies. Reads stop at budget_bytes so a
+    split larger than RAM warms its head rather than thrashing. Returns bytes
+    read; failures are ignored (this is an optimization, never a dependency)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    remaining = [int(budget_bytes)]
+    lock = __import__("threading").Lock()
+
+    def stream(path: Path) -> int:
+        read = 0
+        try:
+            with open(path, "rb", buffering=0) as handle:
+                buffer = bytearray(block_bytes)
+                while True:
+                    with lock:
+                        if remaining[0] <= 0:
+                            return read
+                    got = handle.readinto(buffer)
+                    if not got:
+                        return read
+                    read += got
+                    with lock:
+                        remaining[0] -= got
+        except OSError:
+            return read
+        return read
+
+    paths = [Path(p) for p in paths]
+    if not paths:
+        return 0
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        return sum(pool.map(stream, paths))
+
+
+def _verify_packed_normalization(source_root: Path) -> None:
+    """The pack stores normalized fp16 state, so the normalization is baked
+    in; refuse to read it under different normalize_*.npz files."""
+    import json
+
+    manifest_path = source_root / "packed_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Packed source is missing {manifest_path}")
+    recorded = json.loads(manifest_path.read_text())["normalization"]
+    _, _, current = load_normalization(source_root)
+    for key in ("mean_sha256", "std_sha256"):
+        if recorded[key] != current[key]:
+            raise ValueError(
+                "normalize_*.npz changed since the source was packed; repack "
+                f"(mismatch on {key})"
+            )
+
+
+def _packed_index(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with h5py.File(path, "r") as handle:
+        return (
+            np.asarray(handle["hour"], dtype=np.int64),
+            np.asarray(handle["timestamp"], dtype=np.int64),
+        )
 
 
 def _input_group(handle: h5py.File) -> h5py.Group:
@@ -197,6 +288,14 @@ def inspect_source(
 
 
 class SourceClimateFrameDataset(Dataset):
+    """Normalized fp16 state frames + timestamps, in timestamp order.
+
+    Reads either the per-frame layout (one YYYY_hour.h5 per frame) or, when
+    present, the consolidated year shards from scripts/pack_source.py — the
+    packed layout stores normalized fp16 rows, so both paths return identical
+    values while the packed one does one sequential-friendly read per frame
+    instead of a 33-dataset walk of a tiny file."""
+
     def __init__(
         self, source_root: str | Path, split: str, cadence_hours: int = 6
     ) -> None:
@@ -206,21 +305,57 @@ class SourceClimateFrameDataset(Dataset):
         self.split = split
         self.cadence_hours = int(cadence_hours)
         self.mean, self.std, _ = load_normalization(self.root)
-        self.records = [
-            (path, year, hour, timestamp)
-            for path in source_files(self.root, split)
-            for year, hour, timestamp in (parse_source_filename(path),)
-            if hour % self.cadence_hours == 0
-        ]
+        self._packed_paths = packed_files(self.root, split)
+        self._packed_handles: dict[int, h5py.File] = {}
+        if self._packed_paths:
+            _verify_packed_normalization(self.root)
+            self.records = [
+                (file_index, row, int(hour), int(timestamp))
+                for file_index, path in enumerate(self._packed_paths)
+                for row, (hour, timestamp) in enumerate(
+                    zip(*_packed_index(path))
+                )
+                if hour % self.cadence_hours == 0
+            ]
+        else:
+            self.records = [
+                (path, year, hour, timestamp)
+                for path in source_files(self.root, split)
+                for year, hour, timestamp in (parse_source_filename(path),)
+                if hour % self.cadence_hours == 0
+            ]
         if not self.records:
             raise FileNotFoundError(
                 f"No {cadence_hours}-hour source frames for split {split}"
             )
 
+    def packed_paths(self) -> list[Path]:
+        """Shard files backing this split, or [] under the per-file layout."""
+        return list(self._packed_paths)
+
+    def __getstate__(self) -> dict:
+        # open h5py handles are an unpicklable lazy cache; drop them so the
+        # dataset can cross a spawn boundary (workers reopen on first read)
+        state = dict(self.__dict__)
+        state["_packed_handles"] = {}
+        return state
+
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._packed_paths:
+            file_index, row, _, timestamp = self.records[index]
+            handle = self._packed_handles.get(file_index)
+            if handle is None:
+                # opened lazily so dataloader workers each get their own handle
+                handle = h5py.File(self._packed_paths[file_index], "r")
+                self._packed_handles[file_index] = handle
+            state = np.asarray(handle["state"][row], dtype=np.float16)
+            return (
+                torch.from_numpy(state),
+                torch.tensor(timestamp, dtype=torch.int64),
+            )
         path, _, _, timestamp = self.records[index]
         with h5py.File(path, "r") as handle:
             state = _read_fields(_input_group(handle), STATE_CHANNELS)
@@ -247,10 +382,20 @@ class FramePairDataset(Dataset):
         split: str,
         cadence_hours: int = 6,
         conditioner=None,
+        pair_lead_hours: int | None = None,
     ) -> None:
         self.frames = SourceClimateFrameDataset(dataset_root, split, cadence_hours)
         with h5py.File(Path(token_root) / split / "source.h5", "r") as handle:
-            self.transitions = np.asarray(handle["transitions"], dtype=np.int64)
+            if pair_lead_hours is None:
+                self.transitions = np.asarray(handle["transitions"], dtype=np.int64)
+            else:
+                # must match the token dataset's pairing exactly, or the
+                # noised frames would be encoded against different targets
+                from .tokens import transitions_at_lead
+
+                self.transitions = transitions_at_lead(
+                    np.asarray(handle["timestamp"], dtype=np.int64), pair_lead_hours
+                )
         if len(self.transitions) and int(self.transitions[:, 1].max()) >= len(self.frames):
             raise ValueError(
                 "transitions index past the frame dataset; token/source order mismatch"

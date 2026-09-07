@@ -1,0 +1,49 @@
+# LOCAL (5070) gust2-matched hyperparameter arm for the era5 T30 12x24 dynamics.
+#
+# The 25-epoch cosine arm (local_era5t30_dyn_sched.toml) beat the constant-LR
+# baseline everywhere but still hit its val minimum at ep5. gust2's actual
+# production recipe (uniform across ALL their sweep scripts) trains far
+# longer and gentler: 400 epochs, lr 1e-4, weight_decay 1e-4, substitution
+# noise 0.1 always on. This arm adopts that recipe at 100 epochs (local time
+# compromise; their 400 is an overnight run) so the cosine decay stretches
+# well past the old overfitting window:
+#   lr 2e-4 -> 1e-4 | wd 0.01 -> 1e-4 | epochs 25 -> 100 | +substitution 0.1
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+tokenizer_checkpoint = "/home/zach/code/python/tacs/lucie/local/work/runs/tokenizer_era5t30_seed0/best.pt"
+token_root = "/home/zach/code/python/tacs/lucie/local/work/tokens/era5t30_seed0"
+dynamics_run = "/home/zach/code/python/tacs/lucie/local/runs/dynamics_era5t30_seed0_gust2hp"
+dynamics_checkpoint = "/home/zach/code/python/tacs/lucie/local/runs/dynamics_era5t30_seed0_gust2hp/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = 0
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 16
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 100
+lr = 1e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+lr_schedule = "cosine"
+# gust2's robust recipe: 10% per-position substitution noise on inputs,
+# targets clean (denoising objective). LUCIE's 0.2 test trained worse; 0.1
+# is gust2's production rate and untested here.
+token_substitution_rate = 0.1
+checkpoint_epochs = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]

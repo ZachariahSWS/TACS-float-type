@@ -12,6 +12,7 @@ class TransformerBlock(nn.Module):
         width: int,
         heads: int,
         mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if width % heads:
@@ -19,6 +20,10 @@ class TransformerBlock(nn.Module):
         self.width = int(width)
         self.heads = int(heads)
         self.head_dim = width // heads
+        # nn.Dropout holds no parameters, so enabling this keeps existing
+        # checkpoints loadable
+        self.dropout = float(dropout)
+        self.residual_dropout = nn.Dropout(self.dropout)
         self.norm1 = nn.RMSNorm(width)
         self.qkv = nn.Linear(width, 3 * width, bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim)
@@ -67,13 +72,17 @@ class TransformerBlock(nn.Module):
         k = self.k_norm(qkv[:, :, 1]).transpose(1, 2)
         v = qkv[:, :, 2].transpose(1, 2)
         attended = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, dropout_p=0.0
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
         )
         attended = attended.transpose(1, 2).reshape(batch, length, self.width)
-        x = x + self.proj(attended)
+        x = x + self.residual_dropout(self.proj(attended))
         y = self.norm2(x)
         gate, up = self.gate_up(y).chunk(2, dim=-1)
-        return x + self.down(F.silu(gate) * up)
+        return x + self.residual_dropout(self.down(F.silu(gate) * up))
 
 
 class TransformerStack(nn.Module):
@@ -84,10 +93,14 @@ class TransformerStack(nn.Module):
         heads: int,
         mlp_ratio: float = 4.0,
         activation_checkpointing: bool = False,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
-            [TransformerBlock(width, heads, mlp_ratio) for _ in range(depth)]
+            [
+                TransformerBlock(width, heads, mlp_ratio, dropout=dropout)
+                for _ in range(depth)
+            ]
         )
         self.activation_checkpointing = bool(activation_checkpointing)
         self.final_norm = nn.RMSNorm(width)

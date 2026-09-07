@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .nn import TransformerStack
-from .schema import DEFAULT_SCALES
+from .schema import DEFAULT_SCALES, scale_offsets
 
 
 class NextScaleDynamics(nn.Module):
@@ -21,6 +22,8 @@ class NextScaleDynamics(nn.Module):
         activation_checkpointing: bool = False,
         scale_masks: torch.Tensor | None = None,
         conditioning_dim: int = 0,
+        dropout: float = 0.0,
+        position_masks: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.scales = tuple(tuple(value) for value in scales)
@@ -34,6 +37,15 @@ class NextScaleDynamics(nn.Module):
                 len(scales), self.codebook_size, dtype=torch.bool
             )
         self.register_buffer("scale_masks", scale_masks.bool())
+        # Optional per-position support (total_positions, codebook). When set
+        # it supersedes scale_masks during generation. Strictly tighter: it
+        # forbids ~0.76% of legitimate held-out tokens on this dataset against
+        # per-scale's 0.004%, so it trades distributional reach for a hard
+        # guarantee against off-support emissions.
+        if position_masks is None:
+            self.position_masks = None
+        else:
+            self.register_buffer("position_masks", position_masks.bool())
         self.code_projection = nn.Linear(codebook.shape[1], width, bias=False)
         self.scale_embedding = nn.Embedding(len(scales), width)
         self.frame_embedding = nn.Embedding(2, width)
@@ -47,11 +59,13 @@ class NextScaleDynamics(nn.Module):
             if conditioning_dim > 0
             else None
         )
+        self.dropout = float(dropout)
         self.transformer = TransformerStack(
             width,
             depth,
             heads,
             activation_checkpointing=activation_checkpointing,
+            dropout=self.dropout,
         )
         self.heads_by_scale = nn.ModuleList(
             [nn.Linear(width, self.codebook_size, bias=False) for _ in scales]
@@ -65,6 +79,8 @@ class NextScaleDynamics(nn.Module):
             "heads": self.heads,
             "codebook_size": self.codebook_size,
             "conditioning_dim": self.conditioning_dim,
+            "dropout": self.dropout,
+            "position_masked": self.position_masks is not None,
         }
 
     def _apply_conditioning(
@@ -186,8 +202,15 @@ class NextScaleDynamics(nn.Module):
         current: tuple[torch.Tensor, ...],
         target: tuple[torch.Tensor, ...],
         conditioning: torch.Tensor | None = None,
+        target_context: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        sequence, segments = self._sequence(current, target[:-1])
+        # target_context lets input noising corrupt the teacher-forced t1
+        # scales (gust2 noises t0 AND t1 independently) while the loss keeps
+        # scoring against the clean `target`. At rollout the t1 context is the
+        # model's own possibly-wrong emissions, so training must not see a
+        # pristine context the sampler never provides. None = clean context.
+        context = target if target_context is None else target_context
+        sequence, segments = self._sequence(current, context[:-1])
         sequence = self._apply_conditioning(sequence, conditioning)
         mask = self._attention_mask(segments, sequence.device)
         hidden = self.transformer(sequence, mask)
@@ -203,15 +226,27 @@ class NextScaleDynamics(nn.Module):
             expanded = self._resize_hidden(source, source_shape, target_shape)
             expanded = self._add_target_coordinates(expanded, target_shape)
             logits = self.heads_by_scale[scale_index](expanded)
-            # Do NOT apply scale_masks on this path: forward() feeds the
-            # training/val loss, and val/test contain target codes absent from
-            # train (masks are built from the train split only). Masking those
-            # targets to finfo.min makes their cross-entropy explode to ~1e32,
-            # producing a constant, model-independent, broken val_loss. Masking
-            # belongs only in generation (predict_next_scale), which still masks
-            # so rollouts never sample a code unseen in training.
-            outputs.append(logits)
+            # Same support the sampler enforces, so the softmax normalises over
+            # the tokens the model can actually emit rather than spending mass
+            # on impossible ones. Held-out splits do contain targets outside the
+            # train-derived support; those get -inf here and are DROPPED from
+            # the loss by dynamics_loss (ignore_index) rather than producing the
+            # ~1e32 blow-up that made val_loss constant before.
+            outputs.append(self._apply_support_mask(logits, scale_index))
         return tuple(outputs)
+
+    def _apply_support_mask(
+        self, logits: torch.Tensor, scale_index: int
+    ) -> torch.Tensor:
+        """Forbid tokens outside the training support for this scale/position."""
+        if self.position_masks is not None:
+            offsets = scale_offsets(self.scales)
+            allowed = self.position_masks[
+                offsets[scale_index] : offsets[scale_index + 1]
+            ].unsqueeze(0)
+        else:
+            allowed = self.scale_masks[scale_index].view(1, 1, -1)
+        return logits.masked_fill(~allowed, torch.finfo(logits.dtype).min)
 
     def predict_next_scale(
         self,
@@ -240,31 +275,67 @@ class NextScaleDynamics(nn.Module):
             expanded, self.scales[scale_index]
         )
         logits = self.heads_by_scale[scale_index](expanded)
-        return logits.masked_fill(
-            ~self.scale_masks[scale_index].view(1, 1, -1),
-            torch.finfo(logits.dtype).min,
-        )
+        return self._apply_support_mask(logits, scale_index)
 
 
 def dynamics_loss(
     logits: tuple[torch.Tensor, ...],
     target: tuple[torch.Tensor, ...],
+    weighting: str = "inv_sqrt",
+    label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    losses = tuple(
-        F.cross_entropy(
-            scale_logits.float().reshape(-1, scale_logits.shape[-1]),
-            scale_target.long().reshape(-1),
-        )
-        for scale_logits, scale_target in zip(logits, target)
-    )
-    weights = torch.tensor(
-        [1.0 / math.sqrt(value.numel() / value.shape[0]) for value in target],
-        device=losses[0].device,
-    )
+    """Per-scale cross-entropy, weighted across scales.
+
+    Both schemes up-weight coarse scales (few tokens, most of the signal),
+    but inv_sqrt does so far harder: on the 12x24 ladder it gives the 2-token
+    coarsest scale 48% of the loss and ~1700x the per-token weight of the
+    finest. Since the coarse scales also have the fewest effectively
+    independent samples, that concentrates gradient on the most memorizable
+    part of the problem; inv_log (VAR/gust2's choice) is the flatter option.
+    """
+    # Held-out targets can fall outside the train-derived support that
+    # forward() masks with. Their true class has -inf logit, which would make
+    # cross-entropy infinite (historically ~1e32, a constant that silently
+    # broke val_loss), so drop exactly those positions from the mean and
+    # report how many were dropped rather than letting them dominate.
+    losses = []
+    dropped = []
+    for scale_logits, scale_target in zip(logits, target):
+        flat = scale_logits.float().reshape(-1, scale_logits.shape[-1])
+        truth = scale_target.long().reshape(-1)
+        chosen = flat.gather(1, truth.unsqueeze(1)).squeeze(1)
+        # the mask fills with finfo.min, which IS finite — compare against it
+        floor = torch.finfo(flat.dtype).min / 2
+        forbidden = ~torch.isfinite(chosen) | (chosen <= floor)
+        usable = truth.masked_fill(forbidden, -100)
+        if bool(forbidden.all()):
+            # nothing predictable here; keep it finite and
+            # graph-connected (clamping first, since the masked
+            # entries are finfo.min and would overflow the sum)
+            losses.append(flat.clamp(min=-1e4).sum() * 0.0)
+        else:
+            losses.append(
+                F.cross_entropy(
+                    flat, usable, label_smoothing=label_smoothing, ignore_index=-100
+                )
+            )
+        dropped.append(forbidden.float().mean())
+    losses = tuple(losses)
+    counts = [value.numel() / value.shape[0] for value in target]
+    if weighting == "inv_sqrt":
+        raw = [1.0 / math.sqrt(n) for n in counts]
+    elif weighting == "inv_log":
+        raw = [1.0 / math.log(n + 1.0) for n in counts]
+    elif weighting == "uniform":
+        raw = [1.0 for _ in counts]
+    else:
+        raise ValueError(f"unknown scale weighting {weighting!r}")
+    weights = torch.tensor(raw, device=losses[0].device)
     weights = weights / weights.sum()
     total = sum(weight * loss for weight, loss in zip(weights, losses))
     metrics = {
         "loss": total.detach(),
+        "off_support_target_rate": torch.stack(dropped).mean().detach(),
         **{
             f"scale_{height}x{width}": loss.detach()
             for (height, width), loss in zip(
@@ -280,12 +351,29 @@ def dynamics_loss(
 def sample_next(
     model: NextScaleDynamics,
     current: tuple[torch.Tensor, ...],
-    temperature: float = 0.0,
+    temperature: float | Sequence[float] = 0.0,
     top_k: int | None = None,
+    conditioning: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # scalar temperature applies everywhere; a sequence gives one per scale
+    # (a marginal-entropy calibration schedule)
+    if isinstance(temperature, (int, float)):
+        schedule = [float(temperature)] * len(model.scales)
+    else:
+        schedule = [float(t) for t in temperature]
+        if len(schedule) != len(model.scales):
+            raise ValueError(
+                f"temperature schedule has {len(schedule)} entries "
+                f"for {len(model.scales)} scales"
+            )
+    if model.conditioning_dim > 0 and conditioning is None:
+        raise ValueError(
+            "this model was trained with forcing conditioning; rolling it out "
+            "without a conditioning vector silently drops the FiLM bias"
+        )
     known: list[torch.Tensor] = []
-    for scale in model.scales:
-        logits = model.predict_next_scale(current, tuple(known))
+    for scale, temperature in zip(model.scales, schedule):
+        logits = model.predict_next_scale(current, tuple(known), conditioning)
         if temperature <= 0:
             flat = logits.argmax(dim=-1)
         else:

@@ -1,0 +1,31 @@
+# Local (RTX 5070) diagnostics config for the ERA5 T30 seed0 pipeline.
+#
+# Used by local_analysis.sh with overrides:
+#   REFS=lucie/local/refs_era5 SRC=lucie/local/refs_era5 TOKRUN=era5t30_seed0 \
+#   CFG=configs/local_era5_t30.toml PANELS_ARGS=... COMPARE_ARGS=... \
+#   local_analysis.sh <dynamics_ckpt> <label> <steps>
+#
+# Only [data] (channel layout / leggauss grid) and [paths] (local token file +
+# tokenizer) are read for era5 diagnostics: cli.py builds the channel names,
+# legendre-gauss latitude weights, and wind slices from [data]; the true-data
+# spectrum/histograms come from precomputed refs (--data-spectrum/-histograms),
+# so no source npz is read here. ${LUCIE_WORK} is set by local_analysis.sh to
+# lucie/local/work; the era5t30_seed0 run name is fixed (not ${LUCIE_RUN}).
+config_version = 1
+
+[data]
+source_kind = "era5_npz"
+channels = ["temperature", "humidity", "u_wind", "v_wind", "surface_pressure"]
+grid_shape = [48, 96]
+cadence_hours = 6
+
+[paths]
+dataset_root = "${LUCIE_WORK}/../refs_era5"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_era5t30_seed0/best.pt"
+token_root = "${LUCIE_WORK}/tokens/era5t30_seed0"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_era5t30_seed0"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_era5t30_seed0/latest.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"

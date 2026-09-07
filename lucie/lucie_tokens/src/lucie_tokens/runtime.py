@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import random
@@ -69,6 +70,88 @@ def make_adamw(
         lr=float(lr),
         weight_decay=float(weight_decay),
         fused=device.type == "cuda",
+    )
+
+
+class LrSchedule:
+    """Per-optimizer-step learning-rate schedule.
+
+    "cosine" matches gust2's optax.warmup_cosine_decay_schedule: linear
+    warmup 0 -> peak over warmup_steps, then cosine decay to
+    end_fraction * peak by total_steps. "constant" holds peak_lr forever
+    (the historical behaviour). The only state is the step counter, so
+    resume just restores `step` (or fast-forwards for old checkpoints)."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        kind: str,
+        peak_lr: float,
+        total_steps: int,
+        steps_per_epoch: int,
+        warmup_steps: int,
+        end_fraction: float,
+    ) -> None:
+        if kind not in ("cosine", "constant"):
+            raise ValueError(f"unknown lr_schedule {kind!r}")
+        self.optimizer = optimizer
+        self.kind = kind
+        self.peak_lr = float(peak_lr)
+        self.total_steps = max(int(total_steps), 1)
+        self.steps_per_epoch = max(int(steps_per_epoch), 1)
+        self.warmup_steps = int(warmup_steps)
+        self.end_fraction = float(end_fraction)
+        self.step = 0
+        self.last_lr = self.peak_lr * self._multiplier(0)
+
+    def _multiplier(self, step: int) -> float:
+        if self.kind == "constant":
+            return 1.0
+        if step < self.warmup_steps:
+            return step / max(self.warmup_steps, 1)
+        span = max(self.total_steps - self.warmup_steps, 1)
+        progress = min((step - self.warmup_steps) / span, 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.end_fraction + (1.0 - self.end_fraction) * cosine
+
+    def apply(self) -> float:
+        """Set the LR for the upcoming optimizer step and advance."""
+        self.last_lr = self.peak_lr * self._multiplier(self.step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.last_lr
+        self.step += 1
+        return self.last_lr
+
+    def fast_forward(self, epochs_completed: int) -> None:
+        """Resume-from-old-checkpoint path: no saved schedule state, so
+        reconstruct the step counter from the epoch count."""
+        self.step = int(epochs_completed) * self.steps_per_epoch
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"step": self.step}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.step = int(state["step"])
+
+
+def make_lr_schedule(
+    optimizer: torch.optim.Optimizer,
+    optimization: dict[str, Any],
+    batches_per_epoch: int,
+) -> LrSchedule:
+    accumulation = int(optimization.get("gradient_accumulation", 1))
+    steps_per_epoch = math.ceil(batches_per_epoch / max(accumulation, 1))
+    total_steps = int(optimization["epochs"]) * steps_per_epoch
+    warmup = optimization.get("warmup_steps")
+    warmup = min(1000, total_steps // 10) if warmup is None else int(warmup)
+    return LrSchedule(
+        optimizer,
+        kind=str(optimization.get("lr_schedule", "cosine")),
+        peak_lr=float(optimization["lr"]),
+        total_steps=total_steps,
+        steps_per_epoch=steps_per_epoch,
+        warmup_steps=warmup,
+        end_fraction=float(optimization.get("lr_end_fraction", 0.01)),
     )
 
 

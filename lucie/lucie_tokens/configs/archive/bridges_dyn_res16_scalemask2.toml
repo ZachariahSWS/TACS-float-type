@@ -1,0 +1,111 @@
+# res16 scalemask2: support mask applied in forward() as well as generation,
+# granularity = scale. Paired with the other arm so the granularity is
+# the only difference; val_loss is NOT comparable to pre-masked-forward
+# runs (the softmax now normalises over the allowed set only).
+# res16 posmask: identical to cn2 except generation is masked PER POSITION
+# rather than per scale. Everything else (no CO2, dropout 0.1, wd 0.05,
+# inv_log, float noise 0.1) is held fixed so the mask is the only variable.
+# res16 experiment cn2: regularised variant testing why every cn model
+# overfits by epoch ~5. Four changes vs bridges_dyn_res16_cn.toml:
+#   no CO2 in conditioning | dropout 0.1 | weight decay 0.05 | inv_log
+# 20 epochs, fresh run dir (not a resume of the cn run).
+# Conditioned + input-noised dynamics on the res16x32 tokenizer.
+# Usage: LUCIE_RUN=res16x32_seed0 (tokenize with bridges_h100_res16x32.toml first).
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+# packed source hardcoded via LUCIE_WORK: LUCIE_SOURCE is set by ~/.bashrc on
+# Bridges and clobbers srun/sbatch --export overrides, so never rely on it
+dataset_root = "${LUCIE_WORK}/source_packed_6h"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_scalemask2_${LUCIE_RUN}"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_scalemask2_${LUCIE_RUN}/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = true
+compile_mode = "default"
+num_workers = 4
+prefetch_factor = 2
+shuffle_block = 256
+validation_batches = 16
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [4, 8], [8, 16], [16, 32]]
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+scale_loss_weights = [0.05, 0.1, 0.15, 0.25, 0.45]
+commitment_weight = 0.25
+
+[optimization]
+batch_size = 2
+gradient_accumulation = 4
+epochs = 20
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 32
+
+[dynamics]
+# Tier-A forcing conditioning: [co2, sin/cos(doy), sin/cos(hod)] FiLM bias.
+conditioning = true
+# CO2 rises monotonically -> a near-unique year key the model can memorise,
+# and the held-out year sits in a sparse part of that axis. Cyclic doy/hod
+# features repeat across years, so they carry season without year identity.
+conditioning_co2 = false
+dropout = 0.1
+# Per-position generation support instead of per-scale. Tighter by 2.4x at
+# the finest scale, but it also forbids ~0.76% of legitimate held-out tokens
+# (train does not cover val per-position), so this is an experiment.
+mask_granularity = "scale"
+width = 384
+depth = 8
+heads = 8
+# 80 GB H100 has ample headroom; the smoke sweep showed batch 16 uses ~2.5 GB
+# and runs ~7.5x faster with checkpointing off (~2.5 min/epoch vs ~18.6).
+activation_checkpointing = false
+
+[dynamics_optimization]
+# batch 16 x accum 1 = effective batch 16, identical optimization to the
+# original 4x4 but ~7.5x faster on the underused GPU.
+batch_size = 16
+gradient_accumulation = 1
+epochs = 10
+lr = 2e-4
+weight_decay = 0.05
+gradient_clip = 1.0
+# float-style input noising (same Gaussian on x0/x1, re-encoded per epoch
+# into VRAM-resident token buffers by NoisedEpochPipeline).
+input_noise_std = 0.1
+# flatter than inv_sqrt: cuts the 2-token coarsest scale's share of the loss,
+# which is where the entropy collapse and the memorisation pressure both sit
+scale_loss_weighting = "inv_log"
+# rolling refresh: re-noise 1/4 of pairs per epoch (fresh draw per pair every
+# 4 epochs) — cuts prepass compute and its SM contention with training by 4x
+noise_refresh_k = 4
+# prepass reads are IO-latency-bound, so workers oversubscribe cores on
+# purpose; this is what keeps a cold-cache first epoch from costing 19 min
+noise_prepass_workers = 12
+# 6h split is ~13 GB and read contiguously, so it caches whole
+noise_warm_cache_gb = 16
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

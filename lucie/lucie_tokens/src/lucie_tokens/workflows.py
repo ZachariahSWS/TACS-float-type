@@ -26,6 +26,11 @@ def load_dynamics_checkpoint(
         heads=int(architecture["heads"]),
         activation_checkpointing=False,
         scale_masks=state["scale_masks"],
+        # without this a conditioned checkpoint cannot load: its FiLM
+        # projection has no home in the rebuilt module
+        conditioning_dim=int(architecture.get("conditioning_dim", 0)),
+        dropout=float(architecture.get("dropout", 0.0)),
+        position_masks=state.get("position_masks"),
     )
     model.load_state_dict(state)
     model.to(device).eval()

@@ -29,6 +29,7 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Override with e.g. LUCIE_WALL=00:25:00 (default falls back to the sbatch's own
 # #SBATCH --time when LUCIE_WALL is unset).
 wall="${LUCIE_WALL:-}"
+# LUCIE_AFTER (optional): Slurm dependency spec for the first link only.
 
 for seed in "$@"; do
   # LUCIE_RUN_NAME overrides the run label (default h100_seed<seed>) so a
@@ -43,7 +44,13 @@ for seed in "$@"; do
     [[ -n "${LUCIE_CONFIG:-}" ]] && exports="${exports},LUCIE_CONFIG=${LUCIE_CONFIG}"
     args=(--parsable --chdir="${project_dir}" --export="${exports}")
     [[ -n "$wall" ]] && args+=(--time="${wall}")
-    [[ -n "$dep" ]] && args+=(--dependency="afterany:${dep}")
+    if [[ -n "$dep" ]]; then
+      args+=(--dependency="afterany:${dep}")
+    elif [[ -n "${LUCIE_AFTER:-}" ]]; then
+      # LUCIE_AFTER gates the FIRST link on an external job (e.g.
+      # "afterok:<tokenize-jobid>" so dynamics only starts once tokens exist)
+      args+=(--dependency="${LUCIE_AFTER}")
+    fi
     jobid="$(sbatch "${args[@]}" "${project_dir}/scripts/${sbatch_script}")"
     echo "${stage} seed ${seed} link ${link}/${links}: job ${jobid}${dep:+ (after ${dep})}"
     dep="$jobid"

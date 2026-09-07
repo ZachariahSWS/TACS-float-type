@@ -1,0 +1,112 @@
+# 2026-09-07 arm: stabilised 48x96 pyramid + per-scale codebooks. Queued gated on
+# the plain stab 48x96 pipeline (tokenizer 45423882-887 -> tokenize 45423888)
+# finishing; ~30 SU (tokenizer ~9 h, dynamics ~6 h). Total vocab 13632.
+# ERA5 T30 full-year split, 48x96 finest scale, STABILISED-CASCADE tokenizer
+# (2026-09-07). Identical to era5_y1_res48x96.toml except the two [tokenizer]
+# knobs; sibling of era5_y1_res24x48_stab.toml.
+# ERA5 T30, FULL-YEAR split (same as era5_y1_res24x48.toml), finest scale 48x96:
+# the tokenizer's finest grid equals the data grid, so no spatial downsampling
+# in the token pyramid at all -> 6148 tokens/frame (7 scales). Everything the
+# project has measured says the tokenizer's finest scale is the high-frequency
+# ceiling and resolution buys far more than epochs, so this is the next rung.
+#
+# Risk notes from the 33-channel res48x96 attempts: the EMA codebook ran away
+# (norm guard now in tokenizer.py) and torch.compile broke the in-place EMA
+# buffer update -> compile stays OFF. The 33-ch run reached its best val by
+# epoch ~4-6 before diverging, so 60 epochs is plenty here; tokenizers do not
+# overfit. Dynamics sees a 2 x 6148 token sequence, so batch 8 (memory).
+config_version = 1
+
+[data]
+source_kind = "era5_npz"
+npz_path = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648/era5_T30_regridded.npz"
+channels = ["temperature", "humidity", "u_wind", "v_wind", "surface_pressure"]
+cadence_hours = 6
+dtype = "bf16"
+
+[data.split_index]
+# regridded.npz has 16538 6-hourly frames (1979-01-01 .. ~1990-04).
+# train = first 10 years, val = ONE FULL YEAR (1460 frames), test = the rest.
+train = [0, 14600]
+val = [14600, 16060]
+test = [16060, 16538]
+
+[paths]
+dataset_root = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/era5t30_${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 0
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [3, 6], [6, 12], [12, 24], [24, 48], [48, 96]]
+activation_checkpointing = false
+decoder_activation_checkpointing = false
+decode_scale_batch_size = 7
+scale_loss_weights = [0.03, 0.05, 0.08, 0.12, 0.18, 0.24, 0.30]
+commitment_weight = 0.25
+ema_decay = 0.99
+# CASCADE STABILISATION (2026-09-07): every previous 48x96 tokenizer diverged
+# (epochs 0/1/2/7/18) through the residual cascade -- phi stage gain > 1 at every
+# scale one epoch before the blowup, EMA codebook chasing the growing residual,
+# ratcheting norm guard. phi_gain_limit clamps each stage's rms gain to <= 1 and
+# ema_anchor pins the guard to the encoder token norm. First 48x96 run expected
+# to survive past epoch 20; the ep17 best of the unfixed run was 0.00509.
+phi_gain_limit = 1.0
+ema_anchor = "encoder"
+# PER-SCALE CODEBOOKS on the stabilised pyramid: private id slices, ~1000+ train
+# samples per code at every scale (the shared 4096 book gave the coarse scales
+# ~11 samples/code and the dynamics memorised them). 3x6 at 128 = the middle
+# of the 12x24 bracket (pscb36_128 is the direct 12x24 control for this arm).
+codebook_sizes = [64, 128, 128, 1024, 4096, 4096, 4096]
+dead_code_relative = true
+dead_code_threshold = 0.1
+
+[optimization]
+# batch 8 at full 48x96 finest scale (decoder memory); 60 epochs -- the 33-ch
+# 48x96 run beat res24x48@100ep by epoch 4, and tokenizers do not overfit
+batch_size = 8
+gradient_accumulation = 1
+epochs = 60
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 16
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+# 12k-token teacher-forced sequences: batch 8 for memory, lr unchanged
+batch_size = 8
+gradient_accumulation = 1
+epochs = 50
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+lr_schedule = "cosine"
+checkpoint_epochs = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

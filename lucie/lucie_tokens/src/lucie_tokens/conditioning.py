@@ -32,16 +32,44 @@ _CO2_STEP_SECONDS = 6 * 3600
 
 
 class ForcingConditioner:
-    """Maps a UTC timestamp (seconds) to a fixed-width conditioning vector."""
+    """Maps a UTC timestamp (seconds) to a fixed-width conditioning vector.
 
-    dimension = 5
+    include_co2=False drops the CO2 channel, leaving only the cyclic
+    [sin/cos(doy), sin/cos(hod)] features. CO2 rises monotonically over the
+    record, so it nearly uniquely identifies the year a sample came from —
+    a memorization key rather than a physical driver — and the held-out year
+    sits in a sparsely covered part of that axis. The cyclic features repeat
+    across all years and carry no year identity.
+    """
+
+    # A pre-reduced global-mean series loads in milliseconds instead of
+    # pulling the 1.16 GB spatial field through the reduction on every run.
+    # It is preferred when present; the full field stays as the fallback.
+    # Both yield identical vectors: reducing an already-1D series is a no-op.
+    CO2_FILENAMES = ("co2_global_mean_6hr.npz", "co2_6hr_1981-2024.npz")
 
     def __init__(
         self,
         dataset_root: str | Path,
-        co2_filename: str = "co2_6hr_1981-2024.npz",
+        co2_filename: str | None = None,
+        include_co2: bool = True,
     ) -> None:
-        with np.load(Path(dataset_root) / co2_filename) as bundle:
+        self.include_co2 = bool(include_co2)
+        self.dimension = 5 if self.include_co2 else 4
+        if not self.include_co2:
+            self._co2 = None
+            return
+        root = Path(dataset_root)
+        candidates = (co2_filename,) if co2_filename else self.CO2_FILENAMES
+        for name in candidates:
+            co2_path = root / name
+            if co2_path.exists():
+                break
+        else:
+            raise FileNotFoundError(
+                f"no CO2 series in {root}; looked for {list(candidates)}"
+            )
+        with np.load(co2_path) as bundle:
             # The CO2 field is the largest array in the archive; reduce any
             # spatial dims to a global-mean series indexed by time.
             key = max(bundle.keys(), key=lambda name: bundle[name].size)
@@ -63,16 +91,15 @@ class ForcingConditioner:
         day_of_year = (timestamp - year_start) / (year_end - year_start)
         hour_of_day = moment.hour / 24.0
         tau = 2.0 * math.pi
-        return np.array(
-            [
-                self._co2_at(timestamp),
-                math.sin(tau * day_of_year),
-                math.cos(tau * day_of_year),
-                math.sin(tau * hour_of_day),
-                math.cos(tau * hour_of_day),
-            ],
-            dtype=np.float32,
-        )
+        cyclic = [
+            math.sin(tau * day_of_year),
+            math.cos(tau * day_of_year),
+            math.sin(tau * hour_of_day),
+            math.cos(tau * hour_of_day),
+        ]
+        if not self.include_co2:
+            return np.array(cyclic, dtype=np.float32)
+        return np.array([self._co2_at(timestamp)] + cyclic, dtype=np.float32)
 
 
 class ConditionedTokenPairDataset(TokenPairDataset):
@@ -83,8 +110,9 @@ class ConditionedTokenPairDataset(TokenPairDataset):
         token_root: str | Path,
         split: str,
         conditioner: ForcingConditioner,
+        pair_lead_hours: int | None = None,
     ) -> None:
-        super().__init__(token_root, split)
+        super().__init__(token_root, split, pair_lead_hours=pair_lead_hours)
         self.conditioner = conditioner
         timestamps: dict[Path, np.ndarray] = {}
         for path in self.files:

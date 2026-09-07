@@ -43,3 +43,6 @@ py2d_output/
 
 # Local 5070 inference artifacts (checkpoints, tokens, figures, videos, logs)
 /lucie/local/
+
+# Gust2 reference implementation
+gust2/

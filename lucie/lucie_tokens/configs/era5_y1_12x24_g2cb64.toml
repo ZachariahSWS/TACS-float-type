@@ -1,0 +1,93 @@
+# gust2 CODEBOOK BEHAVIOUR arm on LUCIE's tokenizer, gust2 batch 64, (full-year split, 12x24).
+# Same as era5_y1_12x24.toml except the codebook dynamics copy gust2/vq.py:
+# ema_decay 0.85 (LUCIE 0.99), dead-code threshold 0.25 x the batch's uniform
+# usage (LUCIE: absolute 0.5), dead codes reseeded with random UNIT NORMALS
+# credited with uniform usage (LUCIE: random batch values), norm guard off.
+# lucie2 (the gust2 port) showed this recipe collapses the coarse scales to a
+# few codes (1x2: 1 code, 2x4: 9, 3x6: 63, 753 effective of 4096) and the
+# dynamics model then GENERALISES at coarse scales instead of memorising
+# near-unique codes. This arm asks whether that transfers to LUCIE's
+# encoder/decoder with everything else held fixed.
+config_version = 1
+
+[data]
+source_kind = "era5_npz"
+npz_path = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648/era5_T30_regridded.npz"
+channels = ["temperature", "humidity", "u_wind", "v_wind", "surface_pressure"]
+cadence_hours = 6
+dtype = "bf16"
+
+[data.split_index]
+# regridded.npz has 16538 6-hourly frames (1979-01-01 .. ~1990-04).
+# train = first 10 years, val = ONE FULL YEAR (1460 frames), test = the rest.
+train = [0, 14600]
+val = [14600, 16060]
+test = [16060, 16538]
+
+[paths]
+dataset_root = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/era5t30_${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 0
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [3, 6], [6, 12], [12, 24]]
+activation_checkpointing = false
+decoder_activation_checkpointing = false
+decode_scale_batch_size = 5
+scale_loss_weights = [0.05, 0.10, 0.15, 0.25, 0.45]
+commitment_weight = 0.25
+ema_decay = 0.85
+dead_code_threshold = 0.25
+dead_code_relative = true
+dead_code_reinit = "normal"
+norm_guard_factor = 0.0
+
+[optimization]
+# gust2's tokenizer batch (64): 4x fewer EMA updates per epoch and 4x the
+# tokens per update, which is what its relative dead-code rule sees.
+batch_size = 64
+gradient_accumulation = 1
+epochs = 100
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 64
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 50
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+lr_schedule = "cosine"
+checkpoint_epochs = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

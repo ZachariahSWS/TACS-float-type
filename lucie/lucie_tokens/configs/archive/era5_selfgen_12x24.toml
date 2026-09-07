@@ -1,0 +1,62 @@
+# Self-generated input corruption arm (one-step scheduled sampling), Bridges.
+#
+# Replicates the cosine-schedule operating point for the era5 T30 12x24 model
+# (dynamics_era5t30_seed0_sched: 384/8, batch 16, 25 epochs, lr 2e-4 cosine,
+# wd 0.01, seed 0, inv_sqrt, no noise) with EXACTLY ONE change: half of every
+# batch's input frames are replaced by the CURRENT model's own T=1 sample one
+# step ahead of the preceding frame (self_corrupt.py). Labels stay clean.
+# Every previous corruption scheme used a global/unrealistic noise
+# distribution and smoothed rollout spectra; this one uses the model's real
+# one-step error distribution. Same frozen seed0 tokenizer + tokens.
+config_version = 1
+
+[data]
+source_kind = "era5_npz"
+npz_path = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648/era5_T30_regridded.npz"
+channels = ["temperature", "humidity", "u_wind", "v_wind", "surface_pressure"]
+cadence_hours = 6
+dtype = "bf16"
+
+[data.split_index]
+train = [0, 16000]
+val = [16000, 16200]
+test = [16200, 16538]
+
+[paths]
+dataset_root = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/era5t30_${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}_selfgen"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}_selfgen/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 16
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 25
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+lr_schedule = "cosine"
+self_corrupt_rate = 0.5
+self_corrupt_temperature = 1.0
+checkpoint_epochs = [5, 10, 15, 20, 25]
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32
