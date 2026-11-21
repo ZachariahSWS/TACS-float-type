@@ -1,0 +1,83 @@
+# UNIFORM per-scale loss weighting arm, 10 epochs, 6-hourly data.
+# Identical to dyn_am_res16 except scale_loss_weighting. inv_log gives the
+# 2-token coarse scale 45%% of the loss and ~1450x the per-token weight of the
+# finest; uniform cuts that to 20%% / 256x. Tests whether coarse over-weighting
+# is what drives the coarse memorisation that drags fine scales down in rollout.
+# NOTE val CE is NOT comparable across the weighting change -- judge by
+# per-scale accuracy and rollout HF retention / entropy only.
+# 6-hourly frames, 6-hour lead (42k pairs/epoch)
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+dataset_root = "${LUCIE_WORK}/source_packed_6h"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_res16x32_seed0"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_res16x32_seed0/best.pt"
+token_root = "${LUCIE_WORK}/tokens/res16x32_seed0"
+dynamics_run = "${LUCIE_WORK}/runs/dyn_uni_res16"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dyn_uni_res16/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = true
+compile_mode = "default"
+num_workers = 4
+prefetch_factor = 2
+shuffle_block = 256
+validation_batches = 16
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [4, 8], [8, 16], [16, 32]]
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+scale_loss_weights = [0.0667, 0.1333, 0.2, 0.2667, 0.3333]
+commitment_weight = 0.25
+
+[optimization]
+batch_size = 2
+gradient_accumulation = 4
+epochs = 100
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 32
+
+[dynamics]
+conditioning = true
+conditioning_co2 = false
+dropout = 0.1
+width = 512
+depth = 12
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 10
+checkpoint_epochs = [4, 7, 10]
+lr = 2e-4
+weight_decay = 0.05
+gradient_clip = 1.0
+input_noise_std = 0.1
+noise_refresh_k = 4
+noise_prepass_workers = 12
+scale_loss_weighting = "uniform"
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

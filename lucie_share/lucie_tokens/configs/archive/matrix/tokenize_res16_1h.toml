@@ -1,0 +1,36 @@
+# Hourly tokenization of the frozen res16x32_seed0 tokenizer.
+# Serves BOTH tranche B (1-hour lead) and tranche C (6-hour lead from every
+# start phase) — same tokens, the lead is chosen per-run via pair_lead_hours.
+config_version = 1
+
+[data]
+cadence_hours = 1
+
+[paths]
+dataset_root = "${LUCIE_WORK}/source_packed"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_res16x32_seed0"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_res16x32_seed0/best.pt"
+token_root = "${LUCIE_WORK}/tokens/res16x32_seed0_1h"
+dynamics_run = "${LUCIE_WORK}/runs/unused_res16"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/unused_res16/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+num_workers = 4
+prefetch_factor = 2
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [4, 8], [8, 16], [16, 32]]
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+
+[tokenization]
+batch_size = 32

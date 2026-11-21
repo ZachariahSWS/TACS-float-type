@@ -1,0 +1,47 @@
+# LOCAL (5070) gust2-recipe arm v2: substitution noise on BOTH input surfaces.
+#
+# v1 (local_era5t30_dyn_gust2hp.toml, cancelled at ep25) noised only the t0
+# frame; gust2 independently noises t0 AND the teacher-forced t1 context
+# (train_nsp.py sub0/sub1), with labels clean. This arm adds the t1-context
+# noise (token_noise.substituted_context -> dynamics.forward target_context)
+# at 25 epochs: lr 1e-4, wd 1e-4, cosine over 25, substitution 0.1 both sides.
+# Compare vs sched arm (min 4.381@ep5, final 5.317) and v1 (4.63@ep5-10 -> 6.08@ep25).
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+tokenizer_checkpoint = "/home/zach/code/python/tacs/lucie/local/work/runs/tokenizer_era5t30_seed0/best.pt"
+token_root = "/home/zach/code/python/tacs/lucie/local/work/tokens/era5t30_seed0"
+dynamics_run = "/home/zach/code/python/tacs/lucie/local/runs/dynamics_era5t30_seed0_gust2hp_ctx"
+dynamics_checkpoint = "/home/zach/code/python/tacs/lucie/local/runs/dynamics_era5t30_seed0_gust2hp_ctx/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = 0
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 16
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 25
+lr = 1e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+lr_schedule = "cosine"
+# gust2's robust recipe: 10% per-position substitution noise on inputs,
+# targets clean (denoising objective). LUCIE's 0.2 test trained worse; 0.1
+# is gust2's production rate and untested here.
+token_substitution_rate = 0.1
+checkpoint_epochs = [5, 10, 15, 20, 25]

@@ -1,0 +1,46 @@
+# LOCAL (5070) scheduler-comparison arm for the era5 T30 12x24 dynamics model.
+#
+# Replicates dynamics_era5t30_seed0 (Bridges, 2026-08-24: 384/8, batch 16,
+# 25 epochs, lr 2e-4, wd 0.01, seed 0, default inv_sqrt weighting, val CE
+# minimum 4.89 at epoch 7 rising to 6.46 by epoch 24) with EXACTLY ONE
+# change: the new warmup+cosine LR schedule (lr_schedule = "cosine",
+# 1000-step warmup = ~1 epoch, decay to 1% of peak by epoch 25). If the
+# constant LR was the cause of the mid-run val degradation, this curve
+# should keep improving where the baseline turned over.
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+tokenizer_checkpoint = "/home/zach/code/python/tacs/lucie/local/work/runs/tokenizer_era5t30_seed0/best.pt"
+token_root = "/home/zach/code/python/tacs/lucie/local/work/tokens/era5t30_seed0"
+dynamics_run = "/home/zach/code/python/tacs/lucie/local/runs/dynamics_era5t30_seed0_sched"
+dynamics_checkpoint = "/home/zach/code/python/tacs/lucie/local/runs/dynamics_era5t30_seed0_sched/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = 0
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 16
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 25
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+lr_schedule = "cosine"
+# milestone checkpoints for later rollout-vs-epoch comparison (best/latest
+# alone lost the interesting middle of the baseline run)
+checkpoint_epochs = [5, 10, 15, 20, 25]

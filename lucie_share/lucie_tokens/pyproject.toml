@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lucie-tokens"
+version = "0.1.0"
+description = "Climate-native multi-scale token modeling for LUCIE-3D"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "h5py>=3.12,<4",
+    "numpy>=1.26,<3",
+    "torch>=2.6.0a0,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10"]
+
+[project.scripts]
+lucie-tokens = "lucie_tokens.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lucie_tokens = ["assets/*.geojson"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

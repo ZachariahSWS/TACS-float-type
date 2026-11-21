@@ -51,3 +51,12 @@ gust2/
 /lucie/gust2_climate/
 /bridges/gust2/
 /bridges/jax/
+
+# Self-contained bundle for sharing: keep its figures, models and data inputs.
+# The tokenizer and r6_s0 checkpoints exceed GitHub's 100 MB limit and stay local.
+!/lucie_share/**/*.pt
+!/lucie_share/**/*.npz
+!/lucie_share/**/*.h5
+!/lucie_share/**/*.png
+/lucie_share/lucie_figs/inputs/tokenizer_y1_12x24_best.pt
+/lucie_share/lucie_figs/inputs/ckpts/sc_r6_s0_epoch50_model.pt

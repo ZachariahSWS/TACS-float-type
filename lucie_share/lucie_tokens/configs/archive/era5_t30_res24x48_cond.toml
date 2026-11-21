@@ -1,0 +1,61 @@
+# era5 T30 res24x48 dynamics with day-of-year conditioning (fresh run, A/B
+# against the unconditioned extension in era5_t30_res24x48_ext100.toml).
+#
+# conditioning_co2 = false -> ForcingConditioner emits only the cyclic
+# [sin/cos(doy), sin/cos(hod)] features (dim 4) from the token files' stored
+# timestamps (6-hourly grid anchored 1979-01-01 00Z; a constant phase offset
+# vs the true ERA5 dates is absorbed in training and reproduced at rollout,
+# which reads the same clock). No CO2 series exists for this dataset and the
+# no-co2 constructor never touches dataset_root. Same frozen res24x48
+# tokenizer + tokens; only the dynamics_run is isolated.
+config_version = 1
+
+[data]
+source_kind = "era5_npz"
+npz_path = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648/era5_T30_regridded.npz"
+channels = ["temperature", "humidity", "u_wind", "v_wind", "surface_pressure"]
+cadence_hours = 6
+dtype = "bf16"
+
+[data.split_index]
+train = [0, 16000]
+val = [16000, 16200]
+test = [16200, 16538]
+
+[paths]
+dataset_root = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_era5t30_${LUCIE_RUN}/best.pt"
+token_root = "${LUCIE_WORK}/tokens/era5t30_${LUCIE_RUN}"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}_cond"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}_cond/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 16
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+conditioning = true
+conditioning_co2 = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 100
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+checkpoint_epochs = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

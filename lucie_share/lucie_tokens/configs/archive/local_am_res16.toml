@@ -1,0 +1,55 @@
+# LOCAL (5070) diagnostics for dyn_am_res16.
+config_version = 1
+
+[data]
+cadence_hours = 6
+
+[paths]
+dataset_root = "${LUCIE_SOURCE}"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_res16x32_seed0"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_res16x32_seed0/best.pt"
+token_root = "${LUCIE_WORK}/tokens/res16x32_seed0"
+dynamics_run = "${LUCIE_WORK}/runs/dyn_am_res16"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dyn_am_res16/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+num_workers = 2
+validation_batches = 16
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [4, 8], [8, 16], [16, 32]]
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+
+[dynamics]
+conditioning = true
+conditioning_co2 = false
+dropout = 0.1
+width = 512
+depth = 12
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+epochs = 10
+lr = 2e-4
+weight_decay = 0.05
+gradient_clip = 1.0
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32

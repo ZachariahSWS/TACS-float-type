@@ -1,0 +1,79 @@
+# 1-hour-cadence dynamics probe on the existing 12x24 seed0 tokenizer.
+#
+# The source dataset is natively hourly; the 6-hour view elsewhere is just a
+# cadence filter. The tokenizer is cadence-agnostic (it encodes single
+# frames), so this reuses tokenizer_h100_seed0 unchanged — but tokens and
+# transitions depend on cadence, so they land in a fresh token_root.
+#
+# Stages this config supports: tokenize, train-dynamics, climate-diagnostics.
+# There is no [optimization] section on purpose: train-tokenizer should never
+# run at cadence 1 by accident (it fails fast without it).
+#
+# Pipeline: tokenize once (encodes all 254,210 hourly train frames, ~6x the
+# 6-hour job), then train-dynamics. Note val_loss is not comparable to the
+# 6-hour models' — predicting 1 hour ahead is a different task. Compare via
+# rollout diagnostics at matched lead times (6 steps here = 1 step there).
+config_version = 1
+
+[data]
+cadence_hours = 1
+
+[paths]
+dataset_root = "${LUCIE_SOURCE}"
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_h100_seed0"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_h100_seed0/best.pt"
+token_root = "${LUCIE_WORK}/tokens/h100_seed0_1h"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_1h_${LUCIE_RUN}"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_1h_${LUCIE_RUN}/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+compile_mode = "default"
+num_workers = 4
+prefetch_factor = 2
+shuffle_block = 256
+validation_batches = 16
+
+# Architecture of the frozen seed0 tokenizer being loaded (12x24 ladder via
+# the default scales) — must match the checkpoint.
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+activation_checkpointing = false
+decoder_activation_checkpointing = true
+decode_scale_batch_size = 5
+scale_loss_weights = [0.05, 0.10, 0.15, 0.25, 0.45]
+commitment_weight = 0.25
+
+[tokenization]
+batch_size = 32
+
+[dynamics]
+width = 384
+depth = 8
+heads = 8
+activation_checkpointing = false
+
+[dynamics_optimization]
+batch_size = 16
+gradient_accumulation = 1
+# 1-hour cadence yields ~254k training pairs per epoch (6x the 6-hour 42k).
+# 20 epochs ~= the baseline's total pair budget (100 x 42k), so this probe is
+# an equal-data comparison at ~6 min/epoch (~2 GPU-hours). Scale up only if
+# the probe looks good.
+epochs = 20
+lr = 2e-4
+weight_decay = 0.01
+gradient_clip = 1.0
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32
