@@ -679,6 +679,7 @@ def train_dynamics(config: dict[str, Any]) -> Path:
         conditioning_dim=conditioning_dim,
         dropout=float(model_config.get("dropout", 0.0)),
         position_masks=position_masks,
+        refine_layers=int(model_config.get("refine_layers", 0)),
     ).to(device)
     # per-scale CE weighting + label smoothing, shared by train and eval so
     # val_loss stays comparable to the training objective

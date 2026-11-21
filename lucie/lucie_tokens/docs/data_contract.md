@@ -1,5 +1,9 @@
 # LUCIE data contract
 
+This covers the 33-channel LUCIE-3D HDF5 source on Bridges-2
+(`source_kind = "direct_hourly_h5"`, the default). The ERA5 T30 npz source is described in
+`src/lucie_tokens/era5_npz.py` and the README.
+
 The input is the `1_step_1hr_h5df_test_with_newvars` LUCIE retraining
 snapshot. Source filenames are `YYYY_HHHH.h5`, where `HHHH` is hours after
 January 1 at 00Z. The filename is the timestamp authority.

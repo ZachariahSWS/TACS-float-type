@@ -15,6 +15,8 @@ climate-diagnostics`` (unchanged; the Bridges diag chains call it).
   analyze.py animate-channel --dynamics .. --tokenizer .. --token-file .. --out t.mp4
   analyze.py animate-panels  --dynamics .. --tokenizer .. --token-file .. --out p.mp4
   analyze.py animate-compare --dynamics .. --tokenizer .. --token-file .. --truth-npz ..
+  analyze.py animate-compare --pred-npz frames.npz --truth-npz .. --dataset-root ..
+  analyze.py decode-rollout  --tokenizer .. --rollout-tokens diag_*/rollout_tokens.h5 --out frames.npz
   analyze.py snapshots       --dynamics .. --tokenizer .. --token-file .. --out-dir ..
   analyze.py curves          out.png LABEL=metrics.jsonl ...
   analyze.py autopsy         <ckpt> [<ckpt> ...] [--out <dir>]
@@ -31,9 +33,10 @@ import numpy as np
 import torch
 
 from lucie_tokens import diagnostics as D
+from lucie_tokens.coastline import draw_coastlines
 from lucie_tokens.config import load_config
 from lucie_tokens.runtime import atomic_json
-from lucie_tokens.schema import STATE_CHANNELS
+from lucie_tokens.schema import STATE_CHANNELS, split_flat_tokens
 from lucie_tokens.tokens import load_tokenizer_checkpoint
 from lucie_tokens.workflows import load_dynamics_checkpoint
 
@@ -253,8 +256,9 @@ def cmd_animate_channel(args) -> None:
         cmap = args.cmap
         vmin, vmax = np.percentile(frames, [2, 98])
     fig, ax = plt.subplots(figsize=(6.4, 3.4))
-    im = ax.imshow(frames[0], origin="upper", cmap=cmap, vmin=vmin, vmax=vmax,
+    im = ax.imshow(frames[0], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax,
                    extent=[0, 360, -90, 90], aspect="auto")
+    draw_coastlines(im)
     ax.set_xlabel("longitude")
     ax.set_ylabel("latitude")
     fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
@@ -314,8 +318,9 @@ def cmd_animate_panels(args) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(11, 6))
     images = []
     for ax, (data, title, cmap, vmin, vmax) in zip(axes.ravel(), panels):
-        image = ax.imshow(data[0], origin="upper", cmap=cmap, vmin=vmin, vmax=vmax,
+        image = ax.imshow(data[0], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax,
                           extent=[0, 360, -90, 90], aspect="auto")
+        draw_coastlines(image)
         ax.set_title(title, fontsize=10)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -351,21 +356,37 @@ def cmd_animate_compare(args) -> None:
     truth_raw = truth["raw"].astype(np.float32)
     truth_slot = {int(c): i for i, c in enumerate(truth["collect"])}
     n_truth = truth_raw.shape[0]
-    # keep the initial condition, then every stride
-    device, dynamics, tokenizer, tokens, stamps, conditioner = _load_models(args)
-    with torch.inference_mode():
-        current = D.initial_pyramid(tokens[0], dynamics.scales, device)
-        pred = [tokenizer.decode_indices(current, final_only=True)[0][0, collect].float().cpu().numpy()]
-        for call, current in D.iterate_rollout(
-            dynamics, current, (n_truth - 1) * args.stride,
-            temperature=_temperature(str(args.temperature)), conditioner=conditioner,
-            start_timestamp=int(stamps[0]) if stamps is not None else 0,
-            cadence_hours=args.cadence_hours, device=device,
-        ):
-            if (call + 1) % args.stride == 0:
-                pred.append(tokenizer.decode_indices(current, final_only=True)[0][0, collect].float().cpu().numpy())
-    pred_raw = np.stack(pred).astype(np.float32)
-    n = min(len(pred_raw), n_truth)
+    if args.pred_npz:
+        # frames from decode-rollout: frame k is the state after model call
+        # steps[k] (a multiple of --stride), i.e. truth panel steps[k] // stride
+        bundle = np.load(args.pred_npz)
+        slot = {int(c): i for i, c in enumerate(bundle["collect"])}
+        if missing := [names[c] for c in (ti, qi, ui, vi) if c not in slot]:
+            raise SystemExit(f"{args.pred_npz} lacks channels {missing}")
+        panel = bundle["steps"] // args.stride
+        keep = panel < n_truth
+        pred_raw = bundle["raw"][keep].astype(np.float32)
+        truth_raw = truth_raw[panel[keep]]
+        days = bundle["steps"][keep] * args.cadence_hours / 24
+    else:
+        if not (args.dynamics and args.tokenizer and args.token_file):
+            raise SystemExit("--dynamics, --tokenizer and --token-file are required without --pred-npz")
+        # keep the initial condition, then every stride
+        device, dynamics, tokenizer, tokens, stamps, conditioner = _load_models(args)
+        with torch.inference_mode():
+            current = D.initial_pyramid(tokens[0], dynamics.scales, device)
+            pred = [tokenizer.decode_indices(current, final_only=True)[0][0, collect].float().cpu().numpy()]
+            for call, current in D.iterate_rollout(
+                dynamics, current, (n_truth - 1) * args.stride,
+                temperature=_temperature(str(args.temperature)), conditioner=conditioner,
+                start_timestamp=int(stamps[0]) if stamps is not None else 0,
+                cadence_hours=args.cadence_hours, device=device,
+            ):
+                if (call + 1) % args.stride == 0:
+                    pred.append(tokenizer.decode_indices(current, final_only=True)[0][0, collect].float().cpu().numpy())
+        pred_raw = np.stack(pred).astype(np.float32)
+        days = np.arange(len(pred_raw)) * args.stride * args.cadence_hours / 24
+    n = min(len(pred_raw), len(truth_raw))
     pred_raw, truth_raw = pred_raw[:n], truth_raw[:n]
     meta = D.GridMetadata(args.dataset_root, pred_raw.shape[-2])
 
@@ -391,8 +412,9 @@ def cmd_animate_compare(args) -> None:
     for c, (title, cmap, (vmin, vmax), tdat, pdat) in enumerate(cols):
         for r, (data, label) in enumerate([(tdat, "ERA5 truth"), (pdat, "emulator")]):
             ax = axes[r, c]
-            images[r][c] = ax.imshow(data[0], origin="upper", cmap=cmap, vmin=vmin, vmax=vmax,
+            images[r][c] = ax.imshow(data[0], origin=args.origin, cmap=cmap, vmin=vmin, vmax=vmax,
                                      extent=[0, 360, -90, 90], aspect="auto")
+            draw_coastlines(images[r][c])
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
@@ -409,11 +431,51 @@ def cmd_animate_compare(args) -> None:
 
     _write_video(
         fig, set_images, n,
-        lambda i: suptitle.set_text(
-            f"rollout from val start   day {i * args.stride * args.cadence_hours / 24:.0f}"),
+        lambda i: suptitle.set_text(f"rollout from val start   day {days[i]:.0f}"),
         args.out, args.fps,
     )
     plt.close(fig)
+
+
+def cmd_decode_rollout(args) -> None:
+    """Decode a stored rollout (climate-diagnostics' rollout_tokens.h5) at every
+    stride-th model call into normalized frames, so a video of exactly the
+    scored rollout needs no second (possibly GPU) rollout."""
+    import h5py
+
+    device = _device()
+    tokenizer, _ = load_tokenizer_checkpoint(args.tokenizer, device)
+    with h5py.File(args.rollout_tokens, "r") as handle:
+        tokens = handle["tokens"][...]
+        scales = [tuple(s) for s in json.loads(handle.attrs["scales"])]
+    collect = [int(c) for c in args.collect.split(",")]
+    # stored frame i is the state after model call i + 1
+    calls = np.arange(args.stride, len(tokens) + 1, args.stride)
+    # resumable: the login node kills long CPU jobs, so the output is rewritten
+    # (atomically) every --save-every frames and a rerun continues from it
+    frames = []
+    if os.path.exists(args.out):
+        prev = np.load(args.out)
+        if (list(prev["collect"]) == collect
+                and np.array_equal(prev["steps"], calls[: len(prev["steps"])])):
+            frames = list(prev["raw"])
+            print(f"resuming at {len(frames)}/{len(calls)}", flush=True)
+
+    def save():
+        tmp = f"{args.out}.tmp.npz"
+        np.savez(tmp, raw=np.stack(frames).astype(np.float32),
+                 collect=np.asarray(collect, dtype=np.int64), steps=calls[: len(frames)].astype(np.int64))
+        os.replace(tmp, args.out)
+
+    with torch.inference_mode():
+        for start in range(len(frames), len(calls), args.batch):
+            chunk = calls[start : start + args.batch]
+            pyramid = split_flat_tokens(torch.from_numpy(tokens[chunk - 1].astype(np.int64)).to(device), scales)
+            frames.extend(tokenizer.decode_indices(pyramid, final_only=True)[0][:, collect].float().cpu().numpy())
+            if len(frames) % args.save_every < args.batch or len(frames) == len(calls):
+                save()
+                print(f"decoded {len(frames)}/{len(calls)}", flush=True)
+    print(f"wrote {args.out}: {len(frames)} frames (model calls {calls[0]}..{calls[-1]})")
 
 
 def cmd_snapshots(args) -> None:
@@ -448,8 +510,9 @@ def cmd_snapshots(args) -> None:
         return tuple(float(x) for x in np.percentile(data, [2, 98]))
 
     def panel(ax, data, cmap, vmin, vmax, fig):
-        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper",
+        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, origin="lower",
                        aspect="auto", interpolation="nearest")
+        draw_coastlines(im)
         ax.set_xticks([])
         ax.set_yticks([])
         fig.colorbar(im, ax=ax, fraction=0.032, pad=0.02)
@@ -553,11 +616,11 @@ def cmd_curves(args) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _add_model_args(p, tokenizer=True):
-    p.add_argument("--dynamics", required=True)
+def _add_model_args(p, tokenizer=True, required=True):
+    p.add_argument("--dynamics", required=required)
     if tokenizer:
-        p.add_argument("--tokenizer", required=True)
-    p.add_argument("--token-file", required=True)
+        p.add_argument("--tokenizer", required=required)
+    p.add_argument("--token-file", required=required)
     p.add_argument("--dataset-root", help="normalize_{mean,std}.npz + lat.npy, and forcings for conditioned models")
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--temperature", default="1.0", help="scalar or per-scale comma list")
@@ -682,13 +745,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_animate_panels)
 
     p = sub.add_parser("animate-compare", help="2x3 truth-vs-emulator video from the first frame")
-    _add_model_args(p)
+    _add_model_args(p, required=False)
     _add_field_args(p)
     p.add_argument("--truth-npz", required=True, help="raw (T,C,H,W) + collect")
+    p.add_argument("--pred-npz", help="decode-rollout output: render it instead of rolling the model out "
+                   "(then --dynamics/--tokenizer/--token-file are not needed)")
+    p.add_argument("--origin", choices=["upper", "lower"], default="lower",
+                   help="row 0 at the bottom (lower, north up) or top (upper); both the ERA5 T30 "
+                        "npz and the LUCIE-3D source are stored south-first")
     p.add_argument("--out", default="compare.mp4")
     p.add_argument("--stride", type=int, default=4)
     p.add_argument("--fps", type=int, default=10)
     p.set_defaults(func=cmd_animate_compare)
+
+    p = sub.add_parser("decode-rollout", help="decode a stored rollout_tokens.h5 to frames (for animate-compare --pred-npz)")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--rollout-tokens", required=True, help="climate-diagnostics diag_*/rollout_tokens.h5")
+    p.add_argument("--collect", default="0,1,2,3", help="channel indices to keep (ERA5: T, q, u, v)")
+    p.add_argument("--stride", type=int, default=4, help="keep every Nth model call (match the truth panels)")
+    p.add_argument("--batch", type=int, default=4, help="frames decoded per tokenizer call")
+    p.add_argument("--save-every", type=int, default=40, help="rewrite the (resumable) output every N frames")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_decode_rollout)
 
     p = sub.add_parser("snapshots", help="still frames at chosen rollout steps")
     _add_model_args(p)

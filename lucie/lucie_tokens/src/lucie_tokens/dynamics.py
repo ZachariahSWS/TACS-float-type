@@ -24,6 +24,7 @@ class NextScaleDynamics(nn.Module):
         conditioning_dim: int = 0,
         dropout: float = 0.0,
         position_masks: torch.Tensor | None = None,
+        refine_layers: int = 0,
     ) -> None:
         super().__init__()
         self.scales = tuple(tuple(value) for value in scales)
@@ -70,6 +71,21 @@ class NextScaleDynamics(nn.Module):
         self.heads_by_scale = nn.ModuleList(
             [nn.Linear(width, self.codebook_size, bias=False) for _ in scales]
         )
+        # Optional target-resolution refinement shared by every scale (gust2's
+        # ExpansionHeads run 2 such blocks). 0 -> no module at all, so existing
+        # checkpoints load unchanged.
+        self.refine_layers = int(refine_layers)
+        self.refinement = (
+            TransformerStack(
+                width,
+                self.refine_layers,
+                heads,
+                activation_checkpointing=activation_checkpointing,
+                dropout=self.dropout,
+            )
+            if self.refine_layers > 0
+            else None
+        )
 
     def architecture(self) -> dict:
         return {
@@ -81,6 +97,7 @@ class NextScaleDynamics(nn.Module):
             "conditioning_dim": self.conditioning_dim,
             "dropout": self.dropout,
             "position_masked": self.position_masks is not None,
+            "refine_layers": self.refine_layers,
         }
 
     def _apply_conditioning(
@@ -197,6 +214,32 @@ class NextScaleDynamics(nn.Module):
         )
         return hidden + coordinates.to(hidden.dtype).unsqueeze(0)
 
+    def _scale_logits(
+        self,
+        source: torch.Tensor,
+        source_shape: tuple[int, int],
+        scale_index: int,
+    ) -> torch.Tensor:
+        """Trunk hidden states of the parent scale -> logits for this scale.
+
+        Without refinement this is the whole interface between the trunk and
+        the tokens: a bilinear upsample, a fixed per-position coordinate
+        vector, and one linear map. The four children of a parent cell then
+        differ only by interpolation weights and a constant, so their
+        distributions are near-collinear by construction. `refine_layers > 0`
+        (gust2's ExpansionHeads design) runs self-attention blocks AT THE
+        TARGET RESOLUTION first, so siblings can disagree. Cost is quadratic
+        in tokens-per-scale: cheap at 12x24 (288), heavy at 48x96 (4608).
+        """
+        target_shape = self.scales[scale_index]
+        expanded = self._resize_hidden(source, source_shape, target_shape)
+        expanded = self._add_target_coordinates(expanded, target_shape)
+        if self.refinement is not None:
+            expanded = self.refinement(expanded)
+        return self._apply_support_mask(
+            self.heads_by_scale[scale_index](expanded), scale_index
+        )
+
     def forward(
         self,
         current: tuple[torch.Tensor, ...],
@@ -223,16 +266,14 @@ class NextScaleDynamics(nn.Module):
                 segment = segments[len(self.scales) + scale_index - 1]
                 source = hidden[:, segment[0] : segment[1]]
                 source_shape = self.scales[scale_index - 1]
-            expanded = self._resize_hidden(source, source_shape, target_shape)
-            expanded = self._add_target_coordinates(expanded, target_shape)
-            logits = self.heads_by_scale[scale_index](expanded)
-            # Same support the sampler enforces, so the softmax normalises over
-            # the tokens the model can actually emit rather than spending mass
-            # on impossible ones. Held-out splits do contain targets outside the
-            # train-derived support; those get -inf here and are DROPPED from
-            # the loss by dynamics_loss (ignore_index) rather than producing the
-            # ~1e32 blow-up that made val_loss constant before.
-            outputs.append(self._apply_support_mask(logits, scale_index))
+            # _scale_logits also applies the support mask the sampler enforces,
+            # so the softmax normalises over the tokens the model can actually
+            # emit rather than spending mass on impossible ones. Held-out splits
+            # do contain targets outside the train-derived support; those get
+            # -inf there and are DROPPED from the loss by dynamics_loss
+            # (ignore_index) rather than producing the ~1e32 blow-up that made
+            # val_loss constant before.
+            outputs.append(self._scale_logits(source, source_shape, scale_index))
         return tuple(outputs)
 
     def _apply_support_mask(
@@ -247,6 +288,52 @@ class NextScaleDynamics(nn.Module):
         else:
             allowed = self.scale_masks[scale_index].view(1, 1, -1)
         return logits.masked_fill(~allowed, torch.finfo(logits.dtype).min)
+
+    def begin_generation(
+        self,
+        current: tuple[torch.Tensor, ...],
+        conditioning: torch.Tensor | None = None,
+    ) -> dict:
+        """Encode the current frame once for cached next-scale sampling.
+
+        Equivalent to calling ``predict_next_scale`` with a growing
+        ``target_known``: under the block-causal mask the current frame never
+        attends to target tokens and each target scale only to coarser ones,
+        so their keys/values are fixed once computed and each scale needs one
+        transformer pass over its own new tokens instead of the whole prefix."""
+        sequence, _ = self._sequence(current, ())
+        hidden, caches = self.transformer.forward_cached(
+            self._apply_conditioning(sequence, conditioning)
+        )
+        finest = self.scales[-1][0] * self.scales[-1][1]
+        return {
+            "caches": caches,
+            "source": hidden[:, -finest:],
+            "source_shape": self.scales[-1],
+            "scale_index": 0,
+            "conditioning": conditioning,
+        }
+
+    def generation_logits(self, state: dict) -> torch.Tensor:
+        """Logits of the next scale (same as ``predict_next_scale``)."""
+        return self._scale_logits(
+            state["source"], state["source_shape"], state["scale_index"]
+        )
+
+    def append_generated(self, state: dict, grid: torch.Tensor) -> None:
+        """Feed the sampled grid of the current scale into the cache."""
+        scale_index = state["scale_index"]
+        state["scale_index"] = scale_index + 1
+        if scale_index + 1 >= len(self.scales):
+            return  # the finest scale is never context for another scale
+        embedded = self._apply_conditioning(
+            self._embed_grid(grid, scale_index, 1), state["conditioning"]
+        )
+        hidden, state["caches"] = self.transformer.forward_cached(
+            embedded, state["caches"]
+        )
+        state["source"] = hidden
+        state["source_shape"] = self.scales[scale_index]
 
     def predict_next_scale(
         self,
@@ -268,14 +355,7 @@ class NextScaleDynamics(nn.Module):
             segment = segments[-1]
             source_shape = self.scales[scale_index - 1]
         source = hidden[:, segment[0] : segment[1]]
-        expanded = self._resize_hidden(
-            source, source_shape, self.scales[scale_index]
-        )
-        expanded = self._add_target_coordinates(
-            expanded, self.scales[scale_index]
-        )
-        logits = self.heads_by_scale[scale_index](expanded)
-        return self._apply_support_mask(logits, scale_index)
+        return self._scale_logits(source, source_shape, scale_index)
 
 
 def dynamics_loss(
@@ -372,8 +452,9 @@ def sample_next(
             "without a conditioning vector silently drops the FiLM bias"
         )
     known: list[torch.Tensor] = []
+    state = model.begin_generation(current, conditioning)
     for scale, temperature in zip(model.scales, schedule):
-        logits = model.predict_next_scale(current, tuple(known), conditioning)
+        logits = model.generation_logits(state)
         if temperature <= 0:
             flat = logits.argmax(dim=-1)
         else:
@@ -387,4 +468,5 @@ def sample_next(
                 probabilities.reshape(-1, probabilities.shape[-1]), 1
             ).reshape(probabilities.shape[:-1])
         known.append(flat.reshape(flat.shape[0], scale[0], scale[1]))
+        model.append_generated(state, known[-1])
     return tuple(known)

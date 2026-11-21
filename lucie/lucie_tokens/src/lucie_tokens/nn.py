@@ -61,9 +61,7 @@ class TransformerBlock(nn.Module):
             error_msgs,
         )
 
-    def forward(
-        self, x: torch.Tensor, attention_mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _qkv(self, x: torch.Tensor):
         batch, length, _ = x.shape
         qkv = self.qkv(self.norm1(x)).reshape(
             batch, length, 3, self.heads, self.head_dim
@@ -71,6 +69,20 @@ class TransformerBlock(nn.Module):
         q = self.q_norm(qkv[:, :, 0]).transpose(1, 2)
         k = self.k_norm(qkv[:, :, 1]).transpose(1, 2)
         v = qkv[:, :, 2].transpose(1, 2)
+        return q, k, v
+
+    def _finish(self, x: torch.Tensor, attended: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = x.shape
+        attended = attended.transpose(1, 2).reshape(batch, length, self.width)
+        x = x + self.residual_dropout(self.proj(attended))
+        y = self.norm2(x)
+        gate, up = self.gate_up(y).chunk(2, dim=-1)
+        return x + self.residual_dropout(self.down(F.silu(gate) * up))
+
+    def forward(
+        self, x: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        q, k, v = self._qkv(x)
         attended = F.scaled_dot_product_attention(
             q,
             k,
@@ -78,11 +90,20 @@ class TransformerBlock(nn.Module):
             attn_mask=attention_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
-        attended = attended.transpose(1, 2).reshape(batch, length, self.width)
-        x = x + self.residual_dropout(self.proj(attended))
-        y = self.norm2(x)
-        gate, up = self.gate_up(y).chunk(2, dim=-1)
-        return x + self.residual_dropout(self.down(F.silu(gate) * up))
+        return self._finish(x, attended)
+
+    def forward_cached(
+        self, x: torch.Tensor, past: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Inference step for new tokens ``x`` that attend, unmasked, to every
+        cached key/value and to each other; returns the output and the grown
+        cache. Exact for block-causal generation, where earlier tokens never
+        attend to later ones."""
+        q, k, v = self._qkv(x)
+        if past is not None:
+            k = torch.cat([past[0], k], dim=2)
+            v = torch.cat([past[1], v], dim=2)
+        return self._finish(x, F.scaled_dot_product_attention(q, k, v)), (k, v)
 
 
 class TransformerStack(nn.Module):
@@ -116,3 +137,12 @@ class TransformerStack(nn.Module):
             else:
                 x = block(x, attention_mask)
         return self.final_norm(x)
+
+    def forward_cached(self, x: torch.Tensor, caches: list | None = None):
+        """``TransformerBlock.forward_cached`` through every block: returns the
+        normalised output and the per-block key/value caches."""
+        grown = []
+        for index, block in enumerate(self.blocks):
+            x, cache = block.forward_cached(x, None if caches is None else caches[index])
+            grown.append(cache)
+        return self.final_norm(x), grown

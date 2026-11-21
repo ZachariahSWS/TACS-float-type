@@ -46,3 +46,8 @@ py2d_output/
 
 # Gust2 reference implementation
 gust2/
+
+# Labmates' gust2 code adapted to ERA5, and patches/scripts against it: local only (repo is public)
+/lucie/gust2_climate/
+/bridges/gust2/
+/bridges/jax/

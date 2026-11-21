@@ -437,11 +437,12 @@ class GridMetadata:
     """Per-channel de-normalisation and latitudes from a dataset/refs root.
 
     Missing files degrade gracefully: fields stay normalized and latitudes fall
-    back to a uniform 87N..87S grid (what the videos always assumed)."""
+    back to a uniform 87S..87N grid (row 0 = south, as both the ERA5 T30 npz
+    and the LUCIE-3D source store it)."""
 
     def __init__(self, dataset_root: str | Path | None, height: int) -> None:
         self.mean = self.std = None
-        self.lat = np.linspace(87.0, -87.0, height)
+        self.lat = np.linspace(-87.0, 87.0, height)
         if dataset_root is None:
             return
         root = Path(dataset_root)
@@ -1425,7 +1426,8 @@ def build_era5_references(
     """Truth references for the ERA5 T30 set, computed with the SAME
     accumulators the rollout report uses: truth_spectrum.npz, truth_hist.npz,
     truth_panels.npz (compare video; stride MUST match the render stride),
-    normalize_{mean,std}.npz and lat.npy (gauss latitudes, north first)."""
+    normalize_{mean,std}.npz and lat.npy (gauss latitudes, south first like the
+    npz rows; refs written before 2026-10-14 have it north first, i.e. reversed)."""
     from .era5_npz import load_era5_npz
 
     # fp32 for the truth reference: the climatology should be exact, not the
@@ -1457,7 +1459,7 @@ def build_era5_references(
     np.savez(out / "normalize_mean.npz", **{n: np.float32(data.mean[i]) for i, n in enumerate(channels)})
     np.savez(out / "normalize_std.npz", **{n: np.float32(data.std[i]) for i, n in enumerate(channels)})
     nodes, _ = np.polynomial.legendre.leggauss(frames.shape[-2])
-    lat = np.sort(np.degrees(np.arcsin(np.asarray(nodes))))[::-1]
+    lat = np.sort(np.degrees(np.arcsin(np.asarray(nodes))))
     np.save(out / "lat.npy", lat.astype(np.float64))
     return {"split": split, "frames": int(len(frames)), "channels": channels,
             "wind": (ui, vi), "panels_raw_shape": list(raw.shape), "collect": collect,

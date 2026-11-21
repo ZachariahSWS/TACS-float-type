@@ -512,6 +512,33 @@ def test_sample_next_requires_conditioning_when_model_is_conditioned():
     assert len(sample_next(plain, current, temperature=1.0)) == len(scales)
 
 
+@pytest.mark.parametrize("refine_layers,conditioning_dim", [(0, 0), (2, 0), (0, 5)])
+def test_cached_generation_matches_full_prefix(refine_layers, conditioning_dim):
+    """sample_next's key/value-cached path must give the same per-scale logits
+    as re-encoding the whole prefix with predict_next_scale."""
+    from lucie_tokens.dynamics import NextScaleDynamics
+
+    torch.manual_seed(0)
+    scales = ((1, 2), (2, 4), (3, 6), (6, 12))
+    model = NextScaleDynamics(
+        torch.randn(32, 8), scales=scales, width=32, depth=2, heads=4,
+        refine_layers=refine_layers, conditioning_dim=conditioning_dim,
+    ).eval()
+    batch = 3
+    current = tuple(torch.randint(0, 32, (batch, h, w)) for h, w in scales)
+    target = tuple(torch.randint(0, 32, (batch, h, w)) for h, w in scales)
+    conditioning = torch.randn(batch, conditioning_dim) if conditioning_dim else None
+    with torch.inference_mode():
+        state = model.begin_generation(current, conditioning)
+        for k in range(len(scales)):
+            full = model.predict_next_scale(current, target[:k], conditioning)
+            cached = model.generation_logits(state)
+            finite = torch.isfinite(full)
+            assert torch.equal(finite, torch.isfinite(cached))
+            assert torch.allclose(full[finite], cached[finite], atol=1e-5, rtol=1e-5)
+            model.append_generated(state, target[k])
+
+
 def test_conditioner_prefers_reduced_co2_and_matches_full_field(tmp_path):
     """The pre-reduced global-mean series must be preferred when present and
     give vectors identical to reducing the full spatial field."""
@@ -1433,3 +1460,65 @@ def test_token_space_diagnostics_on_fixture(tmp_path):
     metrics = D.spectrum_metrics(power, power)
     assert np.isclose(metrics["relative_l2"], 0.0) and np.isclose(metrics["high_wavenumber_retention"], 1.0)
     assert D.histogram_emd(np.ones(120), np.ones(120)) == 0.0
+
+
+def test_refinement_mixes_target_positions_and_defaults_unchanged(tmp_path):
+    """refine_layers > 0 adds target-resolution self-attention between the
+    trunk and the per-scale heads (gust2's ExpansionHeads design).
+
+    Default 0 must leave the module, its state_dict and its outputs exactly as
+    before; with refinement, a change confined to ONE parent cell must be able
+    to move the logits of a target position that bilinear upsampling alone
+    cannot reach (the 'siblings can disagree' property the head lacks).
+    """
+    import copy
+
+    from lucie_tokens.dynamics import NextScaleDynamics
+    from lucie_tokens.workflows import load_dynamics_checkpoint
+
+    torch.manual_seed(0)
+    scales = ((1, 2), (2, 4), (4, 8))
+    codebook = torch.randn(16, 8)
+
+    plain = NextScaleDynamics(codebook, scales=scales, width=32, depth=1, heads=4)
+    assert plain.refinement is None and plain.architecture()["refine_layers"] == 0
+    assert not [k for k in plain.state_dict() if k.startswith("refinement.")]
+
+    refined = NextScaleDynamics(
+        codebook, scales=scales, width=32, depth=1, heads=4, refine_layers=2
+    )
+    assert refined.architecture()["refine_layers"] == 2
+    assert len(refined.refinement.blocks) == 2
+
+    # one parent cell perturbed -> can it reach a distant target position?
+    finest = scales[-1]
+    source = torch.zeros(1, scales[-2][0] * scales[-2][1], 32)
+    bumped = source.clone()
+    bumped[0, 0] = 1.0  # first parent cell only
+    far = finest[0] * finest[1] - 1  # bottom-right target token
+    for model, mixes in ((plain, False), (refined, True)):
+        model.eval()
+        with torch.no_grad():
+            base = model._scale_logits(source, scales[-2], len(scales) - 1)
+            bump = model._scale_logits(bumped, scales[-2], len(scales) - 1)
+        moved = not torch.allclose(base[0, far], bump[0, far], atol=1e-6)
+        assert moved is mixes, f"refine={model.refine_layers}: far logits moved={moved}"
+
+    # a refined model survives the checkpoint round trip
+    payload = {
+        "format_version": 1,
+        "architecture": refined.architecture(),
+        "model": refined.state_dict(),
+        "epoch": 0,
+        "best_val": 0.0,
+        "config": {},
+    }
+    path = tmp_path / "refined.pt"
+    torch.save(payload, path)
+    loaded, _ = load_dynamics_checkpoint(path, torch.device("cpu"))
+    assert loaded.refine_layers == 2
+    current = tuple(torch.zeros(1, h, w, dtype=torch.long) for h, w in scales)
+    with torch.no_grad():
+        a = loaded.predict_next_scale(current, current[:1])
+        b = copy.deepcopy(refined).eval().predict_next_scale(current, current[:1])
+    assert torch.allclose(a, b)

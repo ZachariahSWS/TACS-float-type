@@ -23,6 +23,9 @@ lucie-tokens = "lucie_tokens.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+lucie_tokens = ["assets/*.geojson"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

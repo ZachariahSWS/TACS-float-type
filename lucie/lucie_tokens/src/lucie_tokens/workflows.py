@@ -31,6 +31,7 @@ def load_dynamics_checkpoint(
         conditioning_dim=int(architecture.get("conditioning_dim", 0)),
         dropout=float(architecture.get("dropout", 0.0)),
         position_masks=state.get("position_masks"),
+        refine_layers=int(architecture.get("refine_layers", 0)),
     )
     model.load_state_dict(state)
     model.to(device).eval()

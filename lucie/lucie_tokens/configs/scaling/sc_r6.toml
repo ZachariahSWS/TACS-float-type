@@ -1,0 +1,105 @@
+# Scaling-law sweep (2026-09-21), rung 6 of 6: width 768 / depth 12 / heads 16
+# (129.2M / 113.5M). Head dim 48 and width/depth 48 at every rung, so the
+# baseline shape (384/8/8) is rung 4. Tokenizer + tokens = the y1_12x24
+# baseline's (hardcoded); only dynamics_run keys off ${LUCIE_RUN}, which the
+# submit script sets to sc_r6_s<seed>. Nine seeds per rung.
+# Optimizer = gust2's single-GPU NSP recipe (lr 1e-4, wd 1e-4), NOT the
+# baseline's 2e-4 / 0.01, so rung 4 is a retrain, not the standing baseline.
+# ERA5 T30 (Zenodo 15164648) with a FULL-YEAR held-out split.
+#
+# The original split (train [0,16000], val [16000,16200]) validated on 200
+# frames = 50 days starting mid-December: every val CE number and every truth
+# reference for spectra/histograms was ONE WINTER, while rollouts span 500
+# days of all seasons. This split holds out a full year (1460 frames) for
+# validation and the remainder for test, so seasonally-marginal statistics
+# (pixel EMD, coarse-token entropy, chain persistence) are measured against
+# a reference with the same seasonal coverage as the rollout.
+#
+# Dynamics: 50 epochs under the warmup+cosine LR schedule (runtime default),
+# milestone checkpoints every 5 epochs for rollout-vs-epoch selection, and the
+# whole val split scored every epoch (validation_batches = 0).
+config_version = 1
+
+[data]
+source_kind = "era5_npz"
+npz_path = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648/era5_T30_regridded.npz"
+channels = ["temperature", "humidity", "u_wind", "v_wind", "surface_pressure"]
+cadence_hours = 6
+dtype = "bf16"
+
+[data.split_index]
+# regridded.npz has 16538 6-hourly frames (1979-01-01 .. ~1990-04).
+# train = first 10 years, val = ONE FULL YEAR (1460 frames), test = the rest.
+train = [0, 14600]
+val = [14600, 16060]
+test = [16060, 16538]
+
+[paths]
+dataset_root = "${LUCIE_WORK}/datasets/lucie_zenodo_15164648"
+# the tokenizer and its tokens are the BASELINE's (hardcoded, not ${LUCIE_RUN}):
+# this arm changes only the dynamics head, so it must read exactly the tokens
+# era5_y1_12x24.toml produced while writing to its own dynamics_run
+tokenizer_run = "${LUCIE_WORK}/runs/tokenizer_era5t30_y1_12x24"
+tokenizer_checkpoint = "${LUCIE_WORK}/runs/tokenizer_era5t30_y1_12x24/best.pt"
+token_root = "${LUCIE_WORK}/tokens/era5t30_y1_12x24"
+dynamics_run = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}"
+dynamics_checkpoint = "${LUCIE_WORK}/runs/dynamics_era5t30_${LUCIE_RUN}/best.pt"
+
+[runtime]
+device = "cuda"
+precision = "auto"
+seed = "${LUCIE_SEED}"
+resume = true
+performance_mode = true
+compile = false
+validation_batches = 0
+
+[tokenizer]
+width = 256
+depth = 4
+heads = 8
+code_dim = 256
+codebook_size = 4096
+scales = [[1, 2], [2, 4], [3, 6], [6, 12], [12, 24]]
+activation_checkpointing = false
+decoder_activation_checkpointing = false
+decode_scale_batch_size = 5
+scale_loss_weights = [0.05, 0.10, 0.15, 0.25, 0.45]
+commitment_weight = 0.25
+ema_decay = 0.99
+
+[optimization]
+# in-VRAM frames, effective batch 16 (batch 16 x accum 1) to match the codebook
+# EMA update count the seed0 tokenizer used.
+batch_size = 16
+gradient_accumulation = 1
+epochs = 100
+lr = 2e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+
+[tokenization]
+batch_size = 64
+
+[dynamics]
+refine_layers = 0
+width = 768
+depth = 12
+heads = 16
+activation_checkpointing = false
+
+[dynamics_optimization]
+# gust2 single-GPU NSP recipe: batch 16, peak lr 1e-4, wd 1e-4, warmup
+# min(1000, total/10) + cosine to 1% (runtime default), clip 1.0.
+batch_size = 16
+gradient_accumulation = 1
+epochs = 50
+lr = 1e-4
+weight_decay = 1e-4
+gradient_clip = 1.0
+lr_schedule = "cosine"
+checkpoint_epochs = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+
+[evaluation]
+batch_size = 8
+maximum_batches = 32
